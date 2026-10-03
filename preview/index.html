@@ -19,6 +19,10 @@
       import { DEMO_AREAS, DEMO_BUILDING, DEMO_FLOORS, DEMO_PACK, DEMO_ENTITIES, DEMO_STATES, DEMO_PICTURES } from "./demo-data.js";
 
       const params = new URLSearchParams(location.search);
+      // the power flow lines are on with ?flows (and off without, whatever an earlier page stored)
+      try {
+        localStorage.setItem("neoncasa3d.flows", params.has("flows") ? "1" : "0");
+      } catch {}
       // the shop connection of the demo: connected when ?shop is given, with one pack to install and one update
       let license = {
         instance: "3f9c2a7b1e4d8c05",
@@ -57,7 +61,7 @@
         if (importedPacks === null) {
           importedPacks = [DEMO_PACK];
           // the demo has NeonPlan Pro unless ?nopro asks for the locked look
-          if (!params.has("nopro")) importedPacks.push({ format: "fp3dpack", version: 1, id: "demo.pro", name: "NeonPlan Pro (Demo)", publisher: "Mastershort", licensee: null, features: ["camera_cockpit", "weather", "screens"], items: [] });
+          if (!params.has("nopro")) importedPacks.push({ format: "fp3dpack", version: 1, id: "demo.pro", name: "NeonPlan Pro (Demo)", publisher: "Mastershort", licensee: null, features: ["camera_cockpit", "weather", "screens", "energy_pro"], items: [] });
           try {
             const res = await fetch("../private/packs/starter.json");
             if (res.ok) importedPacks.push({ licensee: null, ...(await res.json()) });
@@ -183,6 +187,19 @@
             case "neoncasa3d/packs/install":
               license.packs = license.packs.map((p) => (p.id === msg.pack_id ? { ...p, installed: p.release } : p));
               return { id: msg.pack_id, name: msg.pack_id, publisher: "Mastershort", licensee: "Demo Kunde", release: 1, items: 0 };
+            case "recorder/statistics_during_period": {
+              // today's solar curve: a sunny day, five-minute means from midnight up to now
+              const midnight = new Date();
+              midnight.setHours(0, 0, 0, 0);
+              const slots = Math.floor((Date.now() - midnight.getTime()) / 300000) + 1;
+              const peak = Number(hass.states["sensor.pv_leistung"]?.state) > 2000 ? 7100 : 3400;
+              const curve = Array.from({ length: slots }, (_, i) => {
+                const h = (i * 5) / 60;
+                const sun = Math.max(0, Math.sin((Math.PI * (h - 6.2)) / 13.2));
+                return { start: midnight.getTime() + i * 300000, end: midnight.getTime() + (i + 1) * 300000, mean: Math.round(peak * Math.pow(sun, 1.6) * (0.9 + 0.1 * Math.sin(i * 0.7))) };
+              });
+              return Object.fromEntries((msg.statistic_ids ?? []).map((id) => [id, curve]));
+            }
             case "history/history_during_period": {
               // invented motion of the last half hour: hall, kitchen, then the living-room camera
               const now = Date.now() / 1000;
@@ -200,6 +217,10 @@
         },
       };
 
+      if (params.has("pv")) {
+        // ?pv=5400 sets the solar power (W) of the demo plant, e.g. a sunny noon
+        hass.states["sensor.pv_leistung"] = { ...hass.states["sensor.pv_leistung"], state: params.get("pv") };
+      }
       if (params.has("weather")) {
         // ?weather=pouring|snowy|fog|lightning-rainy|cloudy… sets the demo weather
         hass.states["weather.zuhause"].state = params.get("weather");
