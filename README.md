@@ -1,8 +1,8 @@
 # NeonCasa 3D
 
-Versione italiana indipendente di **NeonPlan 3D**, progetto di **Mastershort**, distribuito con licenza MIT. NeonCasa 3D 1.0.0 deriva dalla versione 1.8.1; commit e provenienza sono in `UPSTREAM.json`. Non è una versione ufficiale dell'autore originale.
+Versione italiana indipendente di **NeonPlan 3D**, progetto di **Mastershort**, distribuito con licenza MIT. NeonCasa 3D 1.1.0 deriva dalla versione 1.9.0; commit e provenienza sono in `UPSTREAM.json`. Non è una versione ufficiale dell'autore originale.
 
-Disegna la casa in Home Assistant, arredala e controlla luci, tapparelle, termostati, sensori e dispositivi nella vista 3D. L'interfaccia include 914 testi italiani. Il pulsante **Disegna casa** apre l'editor. Geometria, grafica, funzioni e controlli restano quelli della versione di partenza.
+Disegna la casa in Home Assistant, arredala e controlla luci, tapparelle, termostati, sensori e dispositivi nella vista 3D. L'interfaccia include 963 testi italiani. Il pulsante **Disegna casa** apre l'editor. Geometria, grafica, funzioni e controlli restano quelli della versione di partenza.
 
 ## Installazione manuale
 
@@ -61,3 +61,14 @@ I pacchetti opzionali e le funzioni Pro non sono resi gratuiti: verifiche delle 
 ## Sviluppo
 
 Dentro `frontend` esegui `npm ci`, `npm run typecheck`, `npm test` e `npm run build`. I bundle compilati sono già inclusi nell'integrazione. L'archivio contiene anche i sorgenti modificabili.
+
+## Novità 1.1.0
+
+- Pareti eliminabili singolarmente con **Nessuna parete**, per ambienti aperti.
+- **Vista iniziale** personalizzata, condivisa da vista 3D, card e modalità tablet.
+- Pannello **Energia** con contatore elettrico, allacciamento alla rete, bilancio energetico e importazione dei sensori dalla dashboard Energia.
+- Più inverter e batterie con sensori propri e modelli differenti.
+- Nomi personalizzati per mobili e dispositivi energetici.
+- Predisposizione originale **Energia Pro**, soggetta a disponibilità e licenza: nessuno sblocco incluso.
+
+Aggiorna da HACS, riavvia Home Assistant e ricarica la pagina. I disegni NeonCasa esistenti restano negli stessi archivi. Prima di aggiornare puoi esportare una copia completa dall'editor. L'interfaccia rimane italiana anche se l'account Home Assistant usa un'altra lingua.

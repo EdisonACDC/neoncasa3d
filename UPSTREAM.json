@@ -2,9 +2,9 @@
   "project": "NeonPlan 3D",
   "author": "Mastershort",
   "url": "https://github.com/Mastershort/neonplan3d",
-  "commit": "69f36925b2655d6f14de916adf08ce6a916fe1e1",
-  "version": "1.8.1",
+  "commit": "bb5261d29fc45ba0bb4a586bca2500f94ec9ea1d",
+  "version": "1.9.0",
   "fork": "NeonCasa 3D",
-  "version_fork": "1.0.0",
+  "version_fork": "1.1.0",
   "license": "MIT"
 }

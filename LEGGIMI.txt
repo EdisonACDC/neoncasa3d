@@ -1,8 +1,8 @@
 # NeonCasa 3D
 
-Versione italiana indipendente di **NeonPlan 3D**, progetto di **Mastershort**, distribuito con licenza MIT. NeonCasa 3D 1.0.0 deriva dalla versione 1.8.1; commit e provenienza sono in `UPSTREAM.json`. Non è una versione ufficiale dell'autore originale.
+Versione italiana indipendente di **NeonPlan 3D**, progetto di **Mastershort**, distribuito con licenza MIT. NeonCasa 3D 1.1.0 deriva dalla versione 1.9.0; commit e provenienza sono in `UPSTREAM.json`. Non è una versione ufficiale dell'autore originale.
 
-Disegna la casa in Home Assistant, arredala e controlla luci, tapparelle, termostati, sensori e dispositivi nella vista 3D. L'interfaccia include 914 testi italiani. Il pulsante **Disegna casa** apre l'editor. Geometria, grafica, funzioni e controlli restano quelli della versione di partenza.
+Disegna la casa in Home Assistant, arredala e controlla luci, tapparelle, termostati, sensori e dispositivi nella vista 3D. L'interfaccia include 963 testi italiani. Il pulsante **Disegna casa** apre l'editor. Geometria, grafica, funzioni e controlli restano quelli della versione di partenza.
 
 ## Installazione manuale
 

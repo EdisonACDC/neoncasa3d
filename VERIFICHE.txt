@@ -1,16 +1,18 @@
-NeonCasa 3D 1.0.0
+NeonCasa 3D 1.1.0 — base NeonPlan 3D 1.9.0
 
-Controlli completati:
-- 914 chiavi italiane: copertura completa e variabili segnaposto conservate.
-- TypeScript: compilazione dei tipi riuscita.
-- Bundle installabili: compilazione riuscita, tutti entro i limiti di dimensione originali.
-- Test frontend: 28 file di test superati, nessuno fallito. Le attese localizzate sono aggiornate alla lingua italiana.
+Verifiche completate:
+- 963 chiavi italiane complete, segnaposto coerenti con la base 1.9.0.
+- TypeScript: controllo dei tipi riuscito.
+- Compilazione dei quattro bundle riuscita, entro i limiti previsti dalla 1.9.0.
+- Suite frontend: 28 file di test superati (inclusi i nuovi controlli energia e pareti).
 - Python: controllo sintattico riuscito.
-- Browser Chrome Headless: editor italiano aperto, piano e stanza creati, vista 3D renderizzata.
-- Componenti originali e NeonCasa registrati nello stesso browser senza errori.
+- Schema backend: accetta dati della versione precedente e conserva nuovi nomi, pareti con altezza zero e vista iniziale.
+- Chrome locale: apertura editor italiano, creazione piano e stanza, rimozione parete, pannello Bilancio energetico, aggiunta contatore, nome personalizzato e memorizzazione vista iniziale.
+- Vista 3D renderizzata senza errori JavaScript.
+- Componenti originali e NeonCasa registrati insieme senza conflitti.
 
 Limiti:
-- Test eseguiti in ambiente di sviluppo e demo, non su un Home Assistant reale.
-- La suite di integrazione Python che richiede Home Assistant non è stata eseguita.
-- Connessione al negozio e pacchetti commerciali non provati.
-- Nessuna installazione sul server dell’utente.
+- Non eseguito sul server Home Assistant dell'utente.
+- Suite di integrazione Python con Home Assistant non eseguita.
+- Acquisto/attivazione commerciale dei pacchetti Pro non verificati; licenze e firme conservate.
+- Energia Pro include la predisposizione della 1.9.0, senza sblocco.
