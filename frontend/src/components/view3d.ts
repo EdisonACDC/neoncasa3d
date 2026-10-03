@@ -1,0 +1,2139 @@
+// Lit wrapper around the lazily loaded 3D viewer.
+
+import { css, html, LitElement, nothing, type PropertyValues } from "lit";
+import {
+  appColor,
+  areaEntities,
+  entityName,
+  furnitureEntities,
+  isActive,
+  isUnavailable,
+  kindOf,
+  lightGlow,
+  openingEntities,
+  openingState,
+  TOGGLE_KINDS,
+  type FurnitureLinks,
+  type OpeningEntities, confirmEntities, fridgeDoors, hasScreen, pictureRuleMatches,
+  fromCelsius,
+  tempUnit,
+  robotRoom,
+  robotRoomSensor,
+  isStatusSensor,
+} from "../devices.ts";
+import { alertColor, alertEntities, alertSources, alertText, findAlerts, type Alert, type AlertSources } from "../alerts.ts";
+import { iconPath, iconSvg } from "../icons.ts";
+import { energySummary, findConsumers, flowColor, flowSegments, powerSensorFor, readPower, type Consumer, type EnergySummary } from "../energy.ts";
+import { STAGE, type Theme } from "../themes.ts";
+import { HEAT_SCALES, heatColor, heatGradient, roomValues, type HeatMode } from "../heatmap.ts";
+import { furnitureName } from "../furniture-names.ts";
+import { fetchImage } from "../api.ts";
+import { formatNumber, translate, type I18nKey } from "../i18n.ts";
+import { getPacks, mountBase, packItem, packsVersion } from "../packs.ts";
+import { parkedVehicles, parkingEntities } from "../parking.ts";
+import { TRAIL_ICON, TRAIL_WINDOW_MS, trailEvents, trailPoints, trailSources, trailTime, type HistoryRow } from "../trail.ts";
+import { limitEffects, weatherEntity, weatherState } from "../weather.ts";
+import { SHOW_ENERGY, SHOW_PRESENCE } from "../flags.ts";
+import { hasFeature, manualUrl, shopUrl, type Feature } from "../features.ts";
+import { searchIndex, searchItems, type SearchItem } from "../search.ts";
+import { coverPositionable, lightAbilities } from "./quick-menu.ts";
+import "./quick-menu.ts";
+import { load3d } from "../load3d.ts";
+import { buildMarkers, cameraMotionSensors, openMoreInfo, placedEntities, stateText, toggleEntity } from "../markers.ts";
+import { furnitureFootprint, isLamp, LAMP_MODEL, outdoorGround, pointInPolygon, surfaceHeight, type Building, type Furniture } from "../model.ts";
+import { floorCounts, floorInfoText, personsInRooms } from "../presence.ts";
+import { controls, tokens } from "../styles.ts";
+import type { HassEntity, HomeAssistant } from "../types.ts";
+import type { DeviceMarker, FloorplanViewer, FloorStack, RobotInfo, Quality, ScreenState, SurfaceGrab, ViewerStats, WallMode } from "../viewer/viewer3d.ts";
+
+/** Which HTML markers are shown: none, only what has no 3D object or shows a value, or all. */
+export type MarkerMode = "none" | "important" | "all";
+
+
+export class Fp3dView3d extends LitElement {
+  static properties = {
+    hass: { attribute: false },
+    building: { attribute: false },
+    floorId: { attribute: false },
+    roomId: { attribute: false },
+    wallMode: { attribute: false },
+    explode: { type: Boolean },
+    markerMode: { attribute: false },
+    heatMode: { attribute: false },
+    theme: { attribute: false },
+    packs: { attribute: false },
+    showEnergy: { attribute: false },
+    flows: { attribute: false },
+    furnish: { type: Boolean },
+    surfaceGrab: { attribute: false },
+    furnishTypes: { attribute: false },
+    trail: { type: Boolean },
+    weather: { type: Boolean },
+    weatherEntityId: { attribute: false },
+    _flash: { state: true },
+    _proHint: { state: true },
+    selectedFurniture: { attribute: false },
+    selectedDevice: { attribute: false },
+    _sky: { state: true },
+    quality: { attribute: false },
+    showStats: { type: Boolean },
+    _stats: { state: true },
+    _error: { state: true },
+    _energy: { state: true },
+    _flows: { state: true },
+    _swipe: { state: true },
+    _menu: { state: true },
+    _through: { state: true },
+    _blend: { state: true },
+    _find: { state: true },
+    _thumbs: { state: true },
+    floorThumbs: { attribute: false },
+    roomLabels: { attribute: false },
+    floorStack: { attribute: false },
+    panelOpen: { attribute: false },
+    alerts: { attribute: false },
+    alertJump: { attribute: false },
+    scenes: { attribute: false },
+    dimmed: { attribute: false },
+    autoOrbit: { attribute: false },
+    _low: { state: true },
+    _narrowStage: { state: true },
+    _alerts: { state: true },
+    _sceneFired: { state: true },
+  };
+
+  declare hass: HomeAssistant;
+  declare building: Building | null;
+  declare floorId: string | null;
+  declare roomId: string | null;
+  declare wallMode: WallMode;
+  declare explode: boolean;
+  declare markerMode: MarkerMode;
+  declare heatMode: HeatMode;
+  /** Imported furniture packs (a new list rebuilds pack furniture). */
+  declare packs: unknown;
+  declare theme: Theme;
+  /** Show the energy values at the top (cards can switch them off). */
+  declare showEnergy: boolean;
+  /** Power flow lines fixed on or off (cards); null: the viewer's own toggle decides. */
+  declare flows: boolean | null;
+  /** Furnishing: furniture and lamps are dragged in 3D (admins, panel only). */
+  declare furnish: boolean;
+  /** Editor: moves solar fields and roof windows with rays from the camera (null: none). */
+  declare surfaceGrab: SurfaceGrab | null;
+  /** Editor: only these furniture types can be moved in 3D (null: all). */
+  declare furnishTypes: readonly string[] | null;
+  /** Motion trail: where motion was reported in the last half hour, with times. */
+  declare trail: boolean;
+  /** Weather outside: rain, snow, fog and clouds from a weather entity, sun and moon from sun.sun. */
+  declare weather: boolean;
+  /** The weather entity to use (null: the first one). */
+  declare weatherEntityId: string | null;
+  /** A lightning flash lights the stage for a moment. */
+  private declare _flash: boolean;
+  /** A Pro feature was asked for without the Pro pack: a hint with the shop link. */
+  private declare _proHint: Feature | null;
+  private flashTimer: ReturnType<typeof setTimeout> | undefined;
+  private cloud = 0;
+  /** Entities that ask before a tap switches them. */
+  private confirmSet = new Set<string>();
+  /** History rows of the trail's sensors (fetched while the trail is shown, again every minute). */
+  private trailRows: Record<string, HistoryRow[]> = {};
+  private trailTimer: ReturnType<typeof setInterval> | undefined;
+  declare selectedFurniture: string | null;
+  declare selectedDevice: string | null;
+  /** How much daylight there is (0 = night, 1 = day), from sun.sun. */
+  private declare _sky: number;
+  declare quality: Quality;
+  declare showStats: boolean;
+  private declare _stats: ViewerStats | null;
+  private declare _error: string | null;
+  private declare _energy: EnergySummary | null;
+  /** A running swipe on a lamp or blind: the value shown next to the finger. */
+  private declare _swipe: { entity: string; kind: "light" | "cover"; start: number; value: number; x: number; y: number } | null;
+  /** Quick menu at a device (long press). */
+  private declare _menu: { entity: string; x: number; y: number } | null;
+  /** Looking through a camera: its live picture lies over the 3D view; `back` is the view to return to. */
+  private declare _through: { entity: string; back: ReturnType<FloorplanViewer["getView"]> } | null;
+  /** How strongly the camera picture covers the 3D view (0 = only 3D, 1 = only the picture). */
+  private declare _blend: number;
+  /** Floor switcher with small pictures of the floors (panel and card; off with a fixed floor). */
+  declare floorThumbs: boolean;
+  /** Room names in 3D (cards can switch them off). */
+  declare roomLabels: boolean;
+  /** Floors below an opened floor: dimmed, stacked (the house up to it) or hidden. */
+  declare floorStack: FloorStack;
+  private declare _thumbs: { floorId: string; url: string }[];
+  /** The viewer runs at the tablet level: heavy CSS effects are left out as well. */
+  private declare _low: boolean;
+  /** A room panel (or sheet) is open next to the view: on small screens the view's own controls hide. */
+  declare panelOpen: boolean;
+  /** The stage is narrower than 700 px (smaller floor pictures, phone layout). */
+  private declare _narrowStage: boolean;
+  private resizeObs: ResizeObserver | null = null;
+  /** Warnings (smoke, water, alarm, window in the rain): pulsing rooms and a banner; jump to new ones. */
+  declare alerts: boolean;
+  declare alertJump: boolean;
+  private declare _alerts: Alert[];
+  private alertSrc: AlertSources | null = null;
+  private alertTimer: ReturnType<typeof setInterval> | undefined;
+  private seenAlerts = new Set<string>();
+  /** A room briefly lit up after a double tap switched its lights. */
+  private roomFlash: { roomId: string; until: number } | null = null;
+  /** Scene and script chips of the selected room. */
+  declare scenes: boolean;
+  private declare _sceneFired: string | null;
+  /** Night (kiosk): no effects, cables or floor pictures. */
+  declare dimmed: boolean;
+  /** Screensaver: the view turns slowly by itself. */
+  declare autoOrbit: boolean;
+  /** Search index (rooms and devices), built when the search opens and reused while it is open. */
+  private findIndex: SearchItem[] | null = null;
+  /** Room colours (heatmap) as last sent to the viewer. */
+  private tintSig = "";
+  private thumbTimer: ReturnType<typeof setTimeout> | undefined;
+  /** What the floor pictures show of the devices (lamps, blinds): they are drawn again when it changes. */
+  private thumbSig = "";
+  private thumbsAt = 0;
+  /** Search ("where is …?"): null = closed. */
+  private declare _find: string | null;
+  private swipeSent = 0;
+  private swipeTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Energy cables from the meter to the consumers (off unless switched on; kept per browser). */
+  private declare _flows: boolean;
+
+  private viewer: FloorplanViewer | null = null;
+  private starting = false;
+  /** States of the placed entities as last sent to the viewer. */
+  private shownStates = new Map<string, HassEntity | undefined>();
+  private shownPacks = -1;
+  /** Entities of each door and window, and the registry they were matched with. */
+  private openingLinks: Map<string, OpeningEntities> | null = null;
+  private linkedRegistry: HomeAssistant["entities"] | undefined;
+  /** Entities of electric furniture (TV, fridge, …). */
+  private furnitureLinks = new Map<string, FurnitureLinks>();
+  /** Room values of the current heatmap (for the legend). */
+  private heatValues = new Map<string, number>();
+  /** Entities whose state changes redraw markers, cables, people and floor labels. */
+  private watched: string[] = [];
+  /** Stored images used as screen pictures, as data URLs (fetched once); null while loading or missing. */
+  private pictureUrls = new Map<string, string | null>();
+  /** Screens showing a camera: their snapshots are refreshed every few seconds (a changing query parameter). */
+  private cameraTick = 0;
+  private cameraTimer: ReturnType<typeof setInterval> | undefined;
+  private cameraScreens = 0;
+  /** The look through a camera itself opens this floor: that floor change must not end it. */
+  private throughFloor: string | null = null;
+
+  constructor() {
+    super();
+    this.building = null;
+    this.floorId = null;
+    this.roomId = null;
+    this.wallMode = "auto";
+    this.explode = true;
+    this.markerMode = "important";
+    this.heatMode = "none";
+    this.theme = "neon";
+    this.furnish = false;
+    this.trail = false;
+    this.weather = true;
+    this.weatherEntityId = null;
+    this._flash = false;
+    this._proHint = null;
+    this.showEnergy = true;
+    this.flows = null;
+    this.selectedFurniture = null;
+    this.selectedDevice = null;
+    this._sky = 0;
+    this.quality = "auto";
+    this.showStats = false;
+    this._stats = null;
+    this._error = null;
+    this._energy = null;
+    this._swipe = null;
+    this._menu = null;
+    this._through = null;
+    this._blend = 0.6;
+    this._find = null;
+    this._thumbs = [];
+    this.floorThumbs = true;
+    this.roomLabels = true;
+    this.floorStack = "dim";
+    this._low = false;
+    this.panelOpen = false;
+    this._narrowStage = false;
+    this.alerts = true;
+    this.alertJump = false;
+    this._alerts = [];
+    this.scenes = true;
+    this._sceneFired = null;
+    this.dimmed = false;
+    this.autoOrbit = false;
+    try {
+      this._flows = localStorage.getItem("neoncasa3d.flows") === "1";
+    } catch {
+      this._flows = false;
+    }
+  }
+
+  connectedCallback(): void {
+    super.connectedCallback();
+    if (this.hasUpdated) {
+      this.observeStage();
+      if (!this.viewer) void this.start();
+    }
+  }
+
+  disconnectedCallback(): void {
+    super.disconnectedCallback();
+    this.resizeObs?.disconnect();
+    this.resizeObs = null;
+    clearInterval(this.alertTimer);
+    this.alertTimer = undefined;
+    clearInterval(this.cameraTimer);
+    this.cameraTimer = undefined;
+    clearInterval(this.trailTimer);
+    this.trailTimer = undefined;
+    clearTimeout(this.flashTimer);
+    this.flashTimer = undefined;
+    this.viewer?.dispose();
+    this.viewer = null;
+  }
+
+  protected firstUpdated(): void {
+    this.observeStage();
+    void this.start();
+  }
+
+  /** Follows the stage's width: the floor pictures shrink on narrow screens. */
+  private observeStage(): void {
+    const stage = this.renderRoot.querySelector(".nc3d-stage");
+    if (!stage || this.resizeObs || typeof ResizeObserver !== "function") return;
+    this.resizeObs = new ResizeObserver((entries) => {
+      const narrow = (entries[0]?.contentRect.width ?? 1000) < 700;
+      if (narrow === this._narrowStage) return;
+      this._narrowStage = narrow;
+      this.scheduleThumbs();
+    });
+    this.resizeObs.observe(stage);
+  }
+
+  private async start(): Promise<void> {
+    if (this.starting || this.viewer) return;
+    this.starting = true;
+    try {
+      const mod = await load3d();
+      if (!this.isConnected) return;
+      const host = this.renderRoot.querySelector(".nc3d-stage") as HTMLElement;
+      this.viewer = mod.createViewer(host, {
+        quality: this.quality,
+        explode: this.explode,
+        onRoomTap: (floorId, roomId) => this.fire("room-tap", { floorId, roomId }),
+        onFloorTap: (floorId) => this.fire("floor-tap", { floorId }),
+        floorInfo: (floor) =>
+          floor.rooms.length === 1 ? translate(this.hass, "floor_rooms_one") : translate(this.hass, "floor_rooms", { n: floor.rooms.length }),
+        onBack: () => this.fire("back", {}),
+        onDeviceTap: (id, x, y) => this.onDeviceTap(id, x, y),
+        onDeviceHold: (id, x, y) => this.onDeviceHold(id, x, y),
+        onRoomDoubleTap: (floorId, roomId) => this.onRoomDoubleTap(floorId, roomId),
+        onDeviceSwipe: (id, phase, dy, x, y) => this.onDeviceSwipe(id, phase, dy, x, y),
+        onFurnitureSelect: (id) => this.fire("furniture-select", { id }),
+        onFurnitureMove: (id, x, z) => this.fire("furniture-move", { id, x, z }),
+        onDeviceSelect: (id) => this.fire("device-select", { id }),
+        onDeviceMove: (id, x, z) => this.fire("device-move", { id, x, z }),
+        // stats can be switched on at any time; they only cause updates while shown
+        onStats: (s) => {
+          if (this.showStats) this._stats = s;
+        },
+      });
+      this.viewer.setWallMode(this.wallMode);
+      this.viewer.setTheme(this.theme);
+      this.viewer.setFurnishMode(this.furnish);
+      this.viewer.setSurfaceGrab(this.surfaceGrab ?? null);
+      this.viewer.setFurnishTypes(this.furnishTypes ?? null);
+      this.viewer.setFloorStack(this.floorStack);
+      this.viewer.setStats(this.showStats);
+      this.viewer.setAutoOrbit(this.autoOrbit ? 0.06 : 0);
+      this._low = this.viewer.low;
+      this.viewer.setPacks([...getPacks()]);
+      this.shownPacks = packsVersion();
+      if (this.building) this.viewer.setBuilding(this.building);
+      this.scheduleThumbs();
+      this.syncDevices(true);
+      this.viewer.setFloor(this.floorId, false);
+      if (this.roomId) this.viewer.selectRoom(this.roomId);
+    } catch (err) {
+      this._error = String(err);
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  protected updated(changed: PropertyValues): void {
+    const v = this.viewer;
+    if (!v) return;
+    // a room or floor chosen elsewhere ends the look through a camera (the view is theirs now)
+    if (this._through && (changed.has("roomId") || changed.has("floorId"))) {
+      if (this.floorId === this.throughFloor) this.throughFloor = null;
+      else this._through = null;
+    }
+    // packs arrive with the building (or after an import): the viewer rebuilds pack furniture
+    if (this.shownPacks !== packsVersion()) {
+      this.shownPacks = packsVersion();
+      v.setPacks([...getPacks()]);
+      // vehicles in parking spots come from packs too: look them up again now that the packs are here
+      if (this.hass && this.building) v.setParked(parkedVehicles(this.hass, this.building));
+    }
+    if (changed.has("building") && this.building) v.setBuilding(this.building);
+    if (changed.has("building") || changed.has("theme") || changed.has("floorThumbs") || changed.has("packs")) this.scheduleThumbs();
+    const forced = ["building", "markerMode", "heatMode", "flows", "alerts", "dimmed"].some((k) => changed.has(k));
+    if (forced || changed.has("hass")) this.syncDevices(forced);
+    if (changed.has("autoOrbit")) v.setAutoOrbit(this.autoOrbit ? 0.06 : 0);
+    if (changed.has("_thumbs") || changed.has("_narrowStage")) v.setLabelInset(this._thumbs.length ? (this.narrowThumbs ? 136 : 184) : 0);
+    if (changed.has("floorId")) v.setFloor(this.floorId);
+    if (changed.has("roomId") && (this.roomId || changed.get("roomId"))) v.selectRoom(this.roomId);
+    if (changed.has("wallMode")) v.setWallMode(this.wallMode);
+    if (changed.has("explode")) v.setExplode(this.explode);
+    if (changed.has("floorStack")) v.setFloorStack(this.floorStack);
+    if (changed.has("theme")) v.setTheme(this.theme);
+    if (changed.has("surfaceGrab")) v.setSurfaceGrab(this.surfaceGrab ?? null);
+    if (changed.has("furnishTypes")) v.setFurnishTypes(this.furnishTypes ?? null);
+    if (changed.has("furnish")) {
+      v.setFurnishMode(this.furnish);
+      this.syncDevices(true);
+    }
+    if (changed.has("selectedFurniture")) v.selectFurniture(this.selectedFurniture);
+    if (changed.has("selectedDevice")) v.setSelectedDevice(this.selectedDevice);
+    if (changed.has("trail")) this.watchTrail();
+    if (changed.has("weather") || changed.has("weatherEntityId")) this.syncDevices(true);
+    if (changed.has("quality") && changed.get("quality") !== undefined) {
+      v.setQuality(this.quality);
+      this._low = v.low;
+    }
+    if (changed.has("showStats")) v.setStats(this.showStats);
+    if (changed.has("building")) this.findIndex = null;
+  }
+
+  /**
+   * Send device markers, door/window states, energy cables, people and floor label texts to the viewer
+   * when a watched entity changed (or the building). Openings are matched with entities again when
+   * the building or the entity registry changes.
+   */
+  private syncDevices(force: boolean): void {
+    const v = this.viewer;
+    const b = this.building;
+    if (!v || !b || !this.hass) return;
+    const hass = this.hass;
+    if (force || !this.openingLinks || this.linkedRegistry !== hass.entities) {
+      this.openingLinks = openingEntities(hass, b.floors);
+      this.furnitureLinks = furnitureEntities(hass, b.floors);
+      this.linkedRegistry = hass.entities;
+      this.findIndex = null;
+      const links = [...this.openingLinks.values()].flatMap((e) => [e.cover, e.contact, e.tilt, e.contact2 ?? null, e.tilt2 ?? null, e.position ?? null]);
+      const placed = placedEntities(b);
+      const cameraSensors = placed.filter((id) => kindOf(id) === "camera").flatMap((id) => cameraMotionSensors(hass, id));
+      const power = placed.map((id) => powerSensorFor(hass, id));
+      const e = b.energy;
+      const presence = b.presence.flatMap((p) => [p.person, p.sensor]);
+      const lights = b.floors.flatMap((f) => f.rooms.flatMap((r) => areaEntities(hass, r.area_id).filter((id) => kindOf(id) === "light")));
+      const furniture = [...this.furnitureLinks.values()].flatMap((l) => [l.entity, l.power]);
+      const doors = b.floors.flatMap((f) => f.furniture.flatMap((m) => [m.door_left ?? null, m.door_right ?? null, m.soc ?? null, m.status ?? null]));
+      const roofWindowIds = (b.settings.roof?.windows ?? []).flatMap((w) => [w.cover, w.contact, w.tilt]).filter((x): x is string => !!x && x !== "none");
+      const robotRooms = b.floors.flatMap((f) => f.furniture.filter((m) => m.type === "robot_vacuum").map((m) => robotRoomSensor(hass, this.furnitureLinks.get(m.id)?.entity ?? null, m.room_sensor)));
+      const pictureRules = b.floors.flatMap((f) => f.furniture.flatMap((m) => (m.pictures ?? []).flatMap((r) => [r.entity, ...(r.image.startsWith("camera:") ? [r.image.slice(7)] : [])])));
+      const heat =
+        this.heatMode === "none"
+          ? []
+          : b.floors.flatMap((f) => f.rooms.flatMap((r) => areaEntities(hass, r.area_id).filter((id) => id.startsWith("sensor."))));
+      this.alertSrc = this.alerts ? alertSources(hass, b, this.weatherEntityId) : null;
+      const warn = this.alertSrc ? alertEntities(this.alertSrc) : [];
+      const parking = parkingEntities(b.floors);
+      const motion = trailSources(hass, b).map((s) => s.entity);
+      const weather = weatherEntity(hass, this.weatherEntityId ?? b.settings.weather_entity);
+      const all = [...placed, ...cameraSensors, ...links, ...power, ...furniture, ...doors, ...robotRooms, ...roofWindowIds, ...pictureRules, e.grid, e.solar, e.battery, e.battery_soc, e.tariff, ...presence, ...lights, ...heat, ...warn, ...parking, ...motion, weather, "sun.sun"];
+      this.watched = [...new Set(all.filter((id): id is string => !!id))];
+      force = true;
+    }
+    const changed = force || this.watched.some((id) => this.shownStates.get(id) !== hass.states[id]);
+    if (!changed) return;
+    this.shownStates = new Map(this.watched.map((id) => [id, hass.states[id]]));
+
+    const consumers = findConsumers(hass, b);
+    const deviceMarkers = buildMarkers(hass, b);
+    const furniture = this.furnitureMarkers(hass, b, new Set(deviceMarkers.map((m) => m.id)), new Set(consumers.map((c) => c.powerEntity)));
+    consumers.push(...furniture.consumers);
+    const summary = energySummary(hass, b, consumers);
+    // a placed power sensor shows its value as state text already, so only devices get a watt badge
+    const byDevice = new Map(consumers.filter((c) => c.id !== c.powerEntity).map((c) => [c.id, c.power]));
+    this.confirmSet = confirmEntities(hass, b.floors);
+    const trail = this.trail ? this.trailNow(hass, b) : [];
+    v.setDevices([
+      ...[...deviceMarkers, ...furniture.markers].map((m) => {
+        // "without watts" drops the power badge (a plug shows only on / off)
+        const power = m.show === "no_power" || ("energyDevice" in m && m.energyDevice) ? null : (byDevice.get(m.id) ?? null);
+        // at night (kiosk) colour effects rest
+        const marker = { ...m, power, powerText: power === null ? undefined : formatPower(hass, power), effect: this.dimmed ? false : m.effect };
+        return { ...marker, pin: this.showPin(marker) };
+      }),
+      // trail spots carry a pin with the time of the motion; the same sensor again stacks its pins
+      ...trail.map((p, i) => ({
+        id: `trail:${i}`,
+        floorId: p.floorId,
+        roomId: null,
+        x: p.x,
+        z: p.z,
+        y: 0.3 + 0.4 * trail.slice(0, i).filter((q) => q.entity === p.entity).length,
+        icon: TRAIL_ICON,
+        name: entityName(hass, p.entity),
+        text: trailTime(hass, p.time),
+        active: false,
+        unavailable: false,
+        glow: null,
+        pin: true,
+      })),
+    ]);
+    v.setTrail(trail);
+    v.setPickTargets(furniture.targets, this.openingTargets());
+    v.setScreens(furniture.screens);
+    v.setFridgeDoors(fridgeDoors(hass, b.floors));
+    v.setRobots(this.robotInfos(hass, b));
+    // roof windows: sash and blind follow their contact and cover like windows do
+    const roofWindows = new Map<string, { open: number; tilt: number; cover: number }>();
+    for (const w of b.settings.roof?.windows ?? []) {
+      const ref = (e: string | null | undefined) => (e && e !== "none" ? e : null);
+      const s = openingState(hass, { cover: ref(w.cover), contact: ref(w.contact), tilt: ref(w.tilt) }, "window");
+      roofWindows.set(w.id, { open: s.open, tilt: s.tilt, cover: s.cover ?? 0 });
+    }
+    v.setRoofWindows(roofWindows);
+    v.setParked(parkedVehicles(hass, b));
+    const types = new Map(b.floors.flatMap((f) => f.openings.map((o) => [o.id, o.type] as const)));
+    const openingStates = new Map([...this.openingLinks!].map(([id, e]) => [id, openingState(hass, e, types.get(id))]));
+    v.setOpeningStates(openingStates);
+    this.setAlerts(this.alertSrc ? findAlerts(hass, b, this.alertSrc, this.openingLinks!) : []);
+    // the floor pictures follow lamps and blinds (not sensors), at most every few seconds
+    const lampSig = [...deviceMarkers, ...furniture.markers].map((m) => `${m.id}:${m.glow ? `${m.glow.level.toFixed(1)}/${m.glow.color.map((c) => c.toFixed(1)).join("/")}` : 0}`).join(";") + "|" + [...openingStates].map(([id, o]) => `${id}:${o.open}:${o.cover === null ? "-" : o.cover.toFixed(1)}`).join(";");
+    if (lampSig !== this.thumbSig) {
+      const first = this.thumbSig === "";
+      this.thumbSig = lampSig;
+      if (!first) this.scheduleThumbs(1500);
+    }
+    const batteryPlaced = b.energy.battery ? b.floors.flatMap((f) => f.placements.filter((p) => p.entity_id === b.energy.battery).map((p) => ({ floorId: f.id, x: p.x, z: p.z })))[0] : null;
+    v.setFlows(
+      !SHOW_ENERGY || !(this.flows ?? this._flows) || this.dimmed
+        ? []
+        : flowSegments({ building: b, consumers, summary, battery: batteryPlaced ?? null }).map((f) => ({
+        floorId: f.floorId,
+        a: f.a,
+        b: f.b,
+        dist: f.dist,
+        power: f.power,
+        color: flowColor(f.kind, summary),
+      })),
+    );
+    const persons = SHOW_PRESENCE ? personsInRooms(hass, b) : [];
+    v.setPersons(persons);
+    const counts = floorCounts(hass, b, this.openingLinks!, persons);
+    v.setFloorInfo(new Map([...counts].map(([id, c]) => [id, floorInfoText(hass, c)])));
+    // daylight: sun through the windows and a lighter sky
+    const sun = hass.states["sun.sun"]?.attributes;
+    const elevation = typeof sun?.elevation === "number" ? sun.elevation : null;
+    v.setSun(elevation !== null && typeof sun?.azimuth === "number" ? { elevation, azimuth: sun.azimuth } : null);
+    // the weather outside: clouds darken the sky, rain, snow and fog fall over the plot
+    const raw = this.weather && !this.dimmed && hasFeature("weather") ? weatherState(hass, weatherEntity(hass, this.weatherEntityId ?? b.settings.weather_entity)) : null;
+    const weather = raw ? limitEffects(raw, b.settings.weather_effects) : null;
+    this.cloud = weather?.cloud ?? 0;
+    this._sky = (elevation === null ? 0 : Math.min(1, Math.max(0, (elevation + 4) / 16))) * (1 - 0.45 * this.cloud);
+    // with the feature on, the viewer always gets the weather (the sun and moon disc shows on clear days too)
+    const disc = weather ? weather.sky : (b.settings.weather_effects ?? ["sky"]).includes("sky");
+    v.setWeather(this.weather && !this.dimmed && hasFeature("weather") ? { ...(weather ?? { rain: 0, snow: 0, fog: 0, cloud: 0, wind: 0 }), sky: this.skyColor(), disc } : null);
+    this.watchLightning(!!weather?.lightning);
+    this.applyTint();
+    const hasEnergy = summary.grid !== null || summary.solar !== null || summary.battery !== null || summary.tariff !== null;
+    const energy = hasEnergy ? summary : null;
+    // a new object would make Lit render again; only changed values do
+    if (JSON.stringify(energy) !== JSON.stringify(this._energy)) this._energy = energy;
+  }
+
+  /** New warnings start the pulse (and a jump to the room when wanted); none stops it. */
+  private setAlerts(alerts: Alert[]): void {
+    const keys = alerts.map((a) => `${a.kind}:${a.entity}`);
+    const fresh = alerts.filter((_, i) => !this.seenAlerts.has(keys[i]));
+    this.seenAlerts = new Set(keys);
+    if (keys.join() !== this._alerts.map((a) => `${a.kind}:${a.entity}`).join()) this._alerts = alerts;
+    if (alerts.length && !this.alertTimer) this.alertTimer = setInterval(() => !document.hidden && this.applyTint(), this._low ? 200 : 100);
+    if (!alerts.length && this.alertTimer) {
+      clearInterval(this.alertTimer);
+      this.alertTimer = undefined;
+    }
+    if (fresh.length && this.alertJump) this.jumpTo(fresh[0]);
+  }
+
+  /** Show where a warning is: its floor and room, or the house for an alarm. */
+  private jumpTo(a: Alert): void {
+    if (!a.floorId) {
+      this.fire("floor-tap", { floorId: null });
+      return;
+    }
+    if (this.floorId !== a.floorId) this.fire("floor-tap", { floorId: a.floorId });
+    // the host switches the floor first; the room follows once it has rendered
+    if (a.roomId) setTimeout(() => this.fire("room-tap", { floorId: a.floorId, roomId: a.roomId }), 60);
+  }
+
+  /** Double tap on a room: all its lights off when one is on, otherwise all on. */
+  private onRoomDoubleTap(floorId: string, roomId: string): void {
+    const b = this.building;
+    const hass = this.hass;
+    const floor = b?.floors.find((f) => f.id === floorId);
+    const room = floor?.rooms.find((r) => r.id === roomId);
+    if (!b || !hass || !floor || !room) return;
+    const ids = new Set(areaEntities(hass, room.area_id).filter((id) => kindOf(id) === "light"));
+    for (const p of floor.placements) if (kindOf(p.entity_id) === "light" && pointInPolygon([p.x, p.z], room.points)) ids.add(p.entity_id);
+    for (const f of floor.furniture) {
+      const e = this.furnitureLinks.get(f.id)?.entity;
+      if (e && isLamp(f.type) && pointInPolygon([f.x, f.z], room.points)) ids.add(e);
+    }
+    // devices that ask before switching stay out of the all-at-once toggle
+    const lights = [...ids].filter((id) => !this.confirmSet.has(id));
+    if (!lights.length) return;
+    const anyOn = lights.some((id) => hass.states[id]?.state === "on");
+    void hass.callService("homeassistant", anyOn ? "turn_off" : "turn_on", { entity_id: lights });
+    this.roomFlash = { roomId, until: performance.now() + 350 };
+    this.applyTint();
+    setTimeout(() => {
+      this.roomFlash = null;
+      this.applyTint();
+    }, 380);
+  }
+
+  private runScene(id: string): void {
+    void this.hass.callService(id.split(".")[0], "turn_on", { entity_id: id });
+    this._sceneFired = id;
+    setTimeout(() => (this._sceneFired = null), 600);
+  }
+
+  /**
+   * Floor colours of the rooms: the heatmap, the pulsing rooms of warnings and the flash of a double
+   * tap; sent to the viewer only when they changed.
+   */
+  private applyTint(): void {
+    const v = this.viewer;
+    const b = this.building;
+    const hass = this.hass;
+    if (!v || !b || !hass) return;
+    let tint: Map<string, [number, number, number]> | null = null;
+    if (this.heatMode !== "none") {
+      const mode = this.heatMode;
+      const values = roomValues(hass, b, mode);
+      this.heatValues = values;
+      tint = new Map([...values].map(([id, value]) => [id, heatColor(mode, value)]));
+    }
+    if (this._alerts.length) {
+      tint ??= new Map();
+      const k = 0.55 + 0.45 * Math.sin(performance.now() / 160);
+      for (const a of this._alerts) {
+        const c = alertColor(a.kind).map((x) => x * k) as [number, number, number];
+        if (a.roomId) tint.set(a.roomId, c);
+        else for (const f of b.floors) for (const r of f.rooms) tint.set(r.id, c);
+      }
+    }
+    if (this.roomFlash && performance.now() < this.roomFlash.until) {
+      tint ??= new Map();
+      tint.set(this.roomFlash.roomId, [0.9, 0.95, 1]);
+    }
+    const sig = tint ? [...tint].map(([id, c]) => `${id}:${c.map((x) => x.toFixed(2)).join(",")}`).join(";") : "";
+    if (sig === this.tintSig) return;
+    this.tintSig = sig;
+    v.setRoomTint(tint);
+  }
+
+  /**
+   * Markers, energy consumers and lit screens of furniture with linked entities. Entities that are
+   * placed as devices as well keep their device marker.
+   */
+  private furnitureMarkers(
+    hass: HomeAssistant,
+    b: Building,
+    taken: Set<string>,
+    consumerSensors: Set<string>,
+  ): { markers: (DeviceMarker & { fromFurniture: boolean; energyDevice?: boolean })[]; consumers: Consumer[]; screens: Map<string, ScreenState>; targets: Map<string, string> } {
+    const markers: (DeviceMarker & { fromFurniture: boolean; energyDevice?: boolean })[] = [];
+    const consumers: Consumer[] = [];
+    const screens = new Map<string, ScreenState>();
+    const targets = new Map<string, string>();
+    for (const floor of b.floors) {
+      for (const f of floor.furniture) {
+        const linked = this.furnitureLinks.get(f.id);
+        if (isLamp(f.type)) {
+          markers.push(this.lampMarker(hass, floor, f, linked?.entity ?? null));
+          continue;
+        }
+        // a home battery with only its charge, a wallbox with only its status still gets its marker
+        const extraRef = f.type === "home_battery" ? f.soc : f.type === "wallbox" ? f.status : null;
+        const extra = extraRef && extraRef !== "none" ? extraRef : null;
+        const link = linked ?? (extra ? { entity: null, power: null } : undefined);
+        if (!link) continue;
+        // a battery goes by its charge first: its power sensor is often placed on its own as well
+        const id = (f.type === "home_battery" ? (extra ?? link.entity ?? link.power) : (link.entity ?? link.power ?? extra))!;
+        targets.set(f.id, id);
+        const st = link.entity ? hass.states[link.entity] : undefined;
+        const power = link.power ? readPower(hass.states[link.power]) : null;
+        if (link.power && power !== null && !consumerSensors.has(link.power)) {
+          consumerSensors.add(link.power);
+          consumers.push({ id, powerEntity: link.power, floorId: floor.id, x: f.x, z: f.z, power: Math.max(0, power) });
+        }
+        const running = (power ?? 0) > 10 || st?.state === "on" || st?.state === "running" || (isStatusSensor(st) && isActive(st));
+        if (f.type === "radiator" && st && kindOf(st.entity_id) === "climate") {
+          // glows while it heats; brighter the further the room is below its target
+          const a = st.attributes;
+          if (a.hvac_action === "heating") {
+            const gap = typeof a.temperature === "number" && typeof a.current_temperature === "number" ? a.temperature - a.current_temperature : 1;
+            screens.set(f.id, { color: [1, 0.42, 0.1], level: Math.min(1, 0.45 + 0.25 * Math.max(0, gap)) });
+          }
+        } else if ((f.type === "washer" || f.type === "dryer" || f.type === "dishwasher") && running) {
+          screens.set(f.id, { color: [0.3, 0.85, 1], level: 0.8 });
+        }
+        if (st && hasScreen(f.type)) {
+          // without the "screens" feature a screen is only lit or dark: no app colour, no picture
+          const live = hasFeature("screens");
+          // a light (an aquarium, a lit panel) glows in its own colour, other entities in the neon cyan
+          const lit = kindOf(st.entity_id) === "light" ? lightGlow(st) : null;
+          const color = live && kindOf(st.entity_id) === "media" ? appColor(st) : lit ? lit.color : isActive(st) || st.state === "playing" ? ([0.22, 0.88, 1] as [number, number, number]) : null;
+          const picture = live && kindOf(st.entity_id) === "media" ? ((st.attributes.entity_picture as string | undefined) ?? null) : null;
+          if (color) screens.set(f.id, { color, level: st.state === "playing" ? 1 : 0.6, picture });
+        }
+        if (taken.has(id)) continue;
+        taken.add(id);
+        const kind = link.entity ? kindOf(link.entity) : null;
+        const room = floor.rooms.find((r) => r.points.length >= 3 && pointInPolygon([f.x, f.z], r.points));
+        markers.push({
+          id,
+          floorId: floor.id,
+          roomId: room?.id ?? null,
+          x: f.x,
+          z: f.z,
+          y: markerHeight(f) + mountBase(floor, f),
+          icon: iconSvg(kind ?? "switch"),
+          name: link.entity ? entityName(hass, link.entity) : furnitureName(hass, f.type),
+          text: f.type === "home_battery" ? this.batteryText(hass, extra, power) : f.type === "wallbox" ? this.wallboxText(hass, extra, power) : st ? stateText(hass, st) : power !== null ? formatPower(hass, Math.max(0, power)) : "",
+          active: st ? isActive(st) : (power ?? 0) > 5,
+          unavailable: st ? isUnavailable(st) : false,
+          glow: null,
+          // its pin grabs the item when furnishing
+          furnitureId: f.id,
+          // inverter, battery, wallbox: their own text (watts, charge, status) is always worth a pin
+          energyDevice: f.type === "inverter" || f.type === "home_battery" || f.type === "wallbox",
+          show: f.marker ?? undefined,
+          fromFurniture: true,
+        });
+      }
+    }
+    // picture rules: the first rule whose entity is in its state puts its picture on the screen (a Pro feature)
+    this.cameraScreens = 0;
+    const fridges = fridgeDoors(hass, b.floors);
+    const rulesOn = hasFeature("screens");
+    for (const floor of b.floors) {
+      for (const f of floor.furniture) {
+        if (!rulesOn || !f.pictures?.length || !hasScreen(f.type)) continue;
+        // a fridge's screen sits on its right door: no picture while that door stands open
+        if (f.type === "fridge_smart" && fridges.get(f.id)?.right) continue;
+        const rule = f.pictures.find((r) => pictureRuleMatches(hass, r));
+        if (!rule) continue;
+        const picture = this.pictureUrl(rule.image);
+        const bg: [number, number, number] = f.screen_bg === "white" ? [0.92, 0.94, 1] : [0.08, 0.08, 0.1];
+        if (picture) screens.set(f.id, { color: bg, level: 1, picture, plain: true });
+      }
+    }
+    this.watchCameras(this.cameraScreens > 0 || !!this._through);
+    return { markers, consumers, screens, targets };
+  }
+
+  /** The trail's spots right now: history rows plus the sensors that are on. */
+  private trailNow(hass: HomeAssistant, b: Building) {
+    const now = Date.now();
+    const sources = trailSources(hass, b);
+    const live = sources.map((s) => {
+      const st = hass.states[s.entity];
+      return { entity: s.entity, state: st?.state, lastChanged: st?.last_changed ? Date.parse(st.last_changed) : undefined };
+    });
+    return trailPoints(sources, trailEvents(this.trailRows, live, now), now);
+  }
+
+  /** While the trail is shown, the sensors' history of the last half hour is fetched, again every minute. */
+  private watchTrail(): void {
+    clearInterval(this.trailTimer);
+    this.trailTimer = undefined;
+    if (this.trail && !hasFeature("camera_cockpit")) this._proHint = "camera_cockpit";
+    if (!this.trail || !hasFeature("camera_cockpit")) {
+      this.trailRows = {};
+      this.syncDevices(true);
+      return;
+    }
+    const fetch = async () => {
+      const hass = this.hass;
+      const b = this.building;
+      if (!hass || !b || document.hidden) return;
+      const ids = trailSources(hass, b).map((s) => s.entity);
+      if (!ids.length) return;
+      try {
+        const rows = await hass.callWS<Record<string, HistoryRow[]> | null>({
+          type: "history/history_during_period",
+          start_time: new Date(Date.now() - TRAIL_WINDOW_MS).toISOString(),
+          entity_ids: ids,
+          minimal_response: true,
+          no_attributes: true,
+          significant_changes_only: false,
+        });
+        this.trailRows = rows ?? {};
+      } catch {
+        this.trailRows = {};
+      }
+      this.syncDevices(true);
+    };
+    void fetch();
+    this.trailTimer = setInterval(() => void fetch(), 60000);
+  }
+
+  /** While a screen shows a camera, its snapshot is fetched again every few seconds (slower on the tablet level). */
+  private watchCameras(on: boolean): void {
+    if (on && !this.cameraTimer) {
+      this.cameraTimer = setInterval(() => {
+        if (document.hidden) return;
+        this.cameraTick++;
+        this.syncDevices(true);
+        if (this._through) this.requestUpdate();
+      }, this._low ? 10000 : 5000);
+    } else if (!on && this.cameraTimer) {
+      clearInterval(this.cameraTimer);
+      this.cameraTimer = undefined;
+    }
+  }
+
+  /** A picture rule's image as a URL: http(s) as is, a camera's current snapshot, a stored image as a data URL (fetched once). */
+  private pictureUrl(image: string): string | null {
+    if (/^https?:\/\//.test(image)) return image;
+    if (image.startsWith("camera:")) {
+      const st = this.hass.states[image.slice(7)];
+      const picture = st?.attributes.entity_picture as string | undefined;
+      if (!picture || isUnavailable(st)) return null;
+      this.cameraScreens++;
+      return picture.startsWith("data:") ? picture : `${picture}${picture.includes("?") ? "&" : "?"}nc3d=${this.cameraTick}`;
+    }
+    if (this.pictureUrls.has(image)) return this.pictureUrls.get(image) ?? null;
+    this.pictureUrls.set(image, null);
+    fetchImage(this.hass, image).then(
+      (url) => {
+        this.pictureUrls.set(image, url);
+        this.syncDevices(true);
+      },
+      () => undefined,
+    );
+    return null;
+  }
+
+  /**
+   * Furniture a robot vacuum drives around: what stands on the floor of the room (cabinets, sofas,
+   * beds, appliances). It drives under tables, desks, chairs and stools, over rugs and under anything
+   * hung on the wall.
+   */
+  private robotObstacles(floor: Building["floors"][number], room: [number, number][]): [number, number][][] {
+    const OPEN_BELOW = new Set(["rug", "worktop", "table", "table_round", "coffee_table", "chair", "office_chair", "stool", "bar_stool", "bench", "desk", "robot_vacuum", "parking", "stairwell", "radiator", "tv_wall", "kitchen_wall", "led_strip"]);
+    return floor.furniture
+      .filter((m) => {
+        if (OPEN_BELOW.has(m.type) || (m.type.startsWith("lamp_") && m.type !== "lamp_floor" && m.type !== "lamp_uplight")) return false;
+        if (m.h < 0.04 || mountBase(floor, m) > 0.12) return false;
+        const item = packItem(m.type);
+        if (item && (item.hole || /table|desk|chair|stool|bench|rug|carpet|mat$/.test(m.type))) return false;
+        return pointInPolygon([m.x, m.z], room) || furnitureFootprint(m).some((p) => pointInPolygon(p, room));
+      })
+      .map((m) => furnitureFootprint(m));
+  }
+
+  /** Robot vacuums (docks with a vacuum entity): where they rest and what they do. */
+  private robotInfos(hass: HomeAssistant, b: Building): RobotInfo[] {
+    const out: RobotInfo[] = [];
+    for (const floor of b.floors) {
+      for (const f of floor.furniture) {
+        if (f.type !== "robot_vacuum") continue;
+        const entity = this.furnitureLinks.get(f.id)?.entity ?? null;
+        const state = entity ? hass.states[entity]?.state : undefined;
+        const mode: RobotInfo["mode"] =
+          state === "cleaning" ? "cleaning" : state === "returning" ? "returning" : state === "error" ? "error" : state === "docked" || !state ? "docked" : "idle";
+        // the robot rests in front of its dock, facing away from it
+        const a = (f.rotation * Math.PI) / 180;
+        const off = f.d * 0.14;
+        const rest: [number, number] = [f.x - Math.sin(a) * off, f.z + Math.cos(a) * off];
+        // the room the robot reports (a "current room" sensor), else the room of its dock
+        const rooms = floor.rooms.filter((r) => r.points.length >= 3);
+        const reported = mode === "cleaning" ? robotRoom(hass, rooms, entity, robotRoomSensor(hass, entity, f.room_sensor)) : null;
+        const room = reported ?? rooms.find((r) => pointInPolygon(rest, r.points));
+        const obstacles = mode === "cleaning" && room ? this.robotObstacles(floor, room.points) : [];
+        out.push({ id: f.id, floorId: floor.id, rest, restHeading: -a, mode, room: room?.points ?? null, roomId: room?.id ?? null, obstacles });
+      }
+    }
+    return out;
+  }
+
+  /** Home battery: "64 % · ▲ 1,5 kW" (▲ charging, ▼ discharging; its power sensor counts discharging positive). */
+  private batteryText(hass: HomeAssistant, soc: string | null, power: number | null): string {
+    const v = soc ? Number(hass.states[soc]?.state) : Number.NaN;
+    const parts: string[] = [];
+    if (Number.isFinite(v)) parts.push(`${formatNumber(hass, v, 0)} %`);
+    if (power !== null && Math.abs(power) >= 10) parts.push(`${power < 0 ? "▲" : "▼"} ${formatPower(hass, Math.abs(power))}`);
+    return parts.join(" · ");
+  }
+
+  /** Wallbox: "lädt · 11 kW", "angesteckt" or its power, from a status sensor (on/off or a state such as charging). */
+  private wallboxText(hass: HomeAssistant, status: string | null, power: number | null): string {
+    const st = status ? hass.states[status] : undefined;
+    const raw = String(st?.state ?? "").toLowerCase();
+    const charging = (power ?? 0) > 50 || /charg|laden|lädt/.test(raw);
+    const plugged = st?.entity_id.startsWith("binary_sensor.") ? raw === "on" : /connect|plug|ready|angesteckt|verbunden|wait|paused|suspend/.test(raw);
+    const label = charging ? translate(hass, "wallbox_charging") : plugged ? translate(hass, "wallbox_plugged") : st && !isUnavailable(st) && !st.entity_id.startsWith("binary_sensor.") ? stateText(hass, st) : "";
+    const watts = power !== null && power > 50 ? formatPower(hass, power) : "";
+    return [label, watts].filter(Boolean).join(" · ");
+  }
+
+  /** A lamp: its 3D model glows with the linked light and is tapped directly. */
+  private lampMarker(hass: HomeAssistant, floor: Building["floors"][number], f: Furniture, entity: string | null): DeviceMarker & { fromFurniture: boolean } {
+    const st = entity ? hass.states[entity] : undefined;
+    const item = packItem(f.type);
+    const model = LAMP_MODEL[f.type] ?? item?.light ?? "floor";
+    // a height above the floor set by hand wins (a table lamp on a shelf, a floor lamp on a platform)
+    const base = f.mount_y != null && !item
+      ? f.mount_y
+      : item || model === "wall" || model === "strip"
+      ? mountBase(floor, f)
+      : model === "table"
+        ? surfaceHeight(floor, f.x, f.z)
+        : model === "bollard" || model === "garden"
+          ? outdoorGround(floor, f.x, f.z)
+          : 0;
+    const room = floor.rooms.find((r) => r.points.length >= 3 && pointInPolygon([f.x, f.z], r.points));
+    const H = floor.height;
+    // pack lamps: the marker sits above the lamp (below it when it hangs from the ceiling)
+    const y = item
+      ? item.mount === "ceiling"
+        ? Math.max(0.5, base - 0.15)
+        : base + f.h + 0.2
+      : {
+      ceiling: H - 0.3,
+      downlight: H - 0.25,
+      spot: H - 0.35,
+      panel: H - 0.25,
+      pendant: Math.max(0.6, H - f.h - 0.25),
+      floor: base + f.h + 0.25,
+      uplight: base + f.h + 0.25,
+      table: base + f.h + 0.2,
+      wall: base + f.h + 0.2,
+      strip: Math.max(0.3, base - 0.2),
+      bollard: base + f.h + 0.25,
+      garden: base + f.h + 0.25,
+    }[model];
+    return {
+      // a lamp without a light keeps a key of its own (it is drawn, but not tappable)
+      id: entity ?? `lamp:${f.id}`,
+      floorId: floor.id,
+      roomId: room?.id ?? null,
+      x: f.x,
+      z: f.z,
+      y,
+      icon: iconSvg("light"),
+      name: entity ? entityName(hass, entity) : furnitureName(hass, f.type),
+      text: st ? stateText(hass, st) : "",
+      active: st ? isActive(st) : false,
+      unavailable: st ? isUnavailable(st) : false,
+      glow: st ? lightGlow(st) : null,
+      lamp: model,
+      rotation: f.rotation,
+      size: [f.w, f.d, f.h],
+      base,
+      pickable: !!entity,
+      furnitureId: f.id,
+      pack: item ? f.type : null,
+      lightY: item ? (item.mount === "ceiling" ? base : base + f.h * 0.85) : undefined,
+      effect: !!st && st.state === "on" && typeof st.attributes.effect === "string" && !/^(none|off|solid|static|normal)$/i.test(st.attributes.effect),
+      variant: f.variant,
+      show: f.marker ?? undefined,
+      fromFurniture: true,
+    };
+  }
+
+  /**
+   * Marker rule: "important" leaves out devices that their 3D object stands for (lamps, a TV that is
+   * off) and keeps devices without an object (sensors, heating, switches) and values (watts, the app).
+   */
+  private showPin(m: DeviceMarker & { fromFurniture?: boolean; energyDevice?: boolean }): boolean {
+    // while furnishing every placed device has a pin to grab it by
+    if (this.furnish && !m.fromFurniture) return true;
+    // the device's own setting wins over the marker mode (except "none", which hides every marker)
+    if (m.show === "never" || this.markerMode === "none") return false;
+    if (m.show === "always" || this.markerMode === "all") return true;
+    if (m.lamp || m.model) return false;
+    const kind = kindOf(m.id);
+    if (kind === "light") return false;
+    if (m.fromFurniture) return (m.power ?? 0) >= 1 || (kind === "media" && m.active) || (!!m.energyDevice && !!m.text);
+    return true;
+  }
+
+  /** Tapping a window opens its blind (or contact); a door or garage door its cover or contact. */
+  private openingTargets(): Map<string, string> {
+    const out = new Map<string, string>();
+    for (const [id, e] of this.openingLinks ?? []) {
+      const target = e.cover ?? e.contact ?? e.tilt;
+      if (target) out.set(id, target);
+    }
+    return out;
+  }
+
+  /** Pictures of the floors, drawn a moment after the plan or the look changed (once, not per frame). */
+  private scheduleThumbs(delay = 600): void {
+    clearTimeout(this.thumbTimer);
+    const floors = this.building?.floors.filter((f) => f.rooms.length).length ?? 0;
+    if (!this.floorThumbs || floors < 2) {
+      this._thumbs = [];
+      return;
+    }
+    // at most every few seconds, however often lamps change (the tablet level waits longer)
+    const wait = Math.max(delay, this.thumbsAt + (this._low ? 8000 : 4000) - Date.now());
+    this.thumbTimer = setTimeout(() => {
+      // at night (kiosk) the pictures are drawn once and then rest
+      if (!this.viewer || (this.dimmed && this._thumbs.length)) return;
+      // a hidden tab draws nothing; the pictures follow once it shows again
+      if (document.hidden) {
+        this.scheduleThumbs(3000);
+        return;
+      }
+      this.thumbsAt = Date.now();
+      this._thumbs = this.viewer.floorThumbnails(this.narrowThumbs ? 104 : 150, this.narrowThumbs ? 78 : 112);
+    }, wait);
+  }
+
+  private get narrowThumbs(): boolean {
+    return this._narrowStage;
+  }
+
+  private renderThumbs() {
+    if (!this._thumbs.length || !this.building) return nothing;
+    const names = new Map(this.building.floors.map((f) => [f.id, f.name]));
+    // the highest floor on top
+    const order = [...this._thumbs].sort(
+      (a, b) => (this.building!.floors.find((f) => f.id === b.floorId)?.elevation ?? 0) - (this.building!.floors.find((f) => f.id === a.floorId)?.elevation ?? 0),
+    );
+    return html`<nav class="nc3d-thumbs ${this.narrowThumbs ? "nc3d-thumbs-small" : ""}" aria-label=${translate(this.hass, "floors")}>
+      <button class="nc3d-thumb nc3d-thumb-house" aria-pressed=${this.floorId === null} @click=${() => this.fire("floor-tap", { floorId: null })}>
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3 11l9-7 9 7M5 10v10h14V10" /></svg>
+        <span>${translate(this.hass, "all_floors")}</span>
+      </button>
+      ${order.map(
+        (t) => html`<button class="nc3d-thumb" aria-pressed=${this.floorId === t.floorId} @click=${() => this.fire("floor-tap", { floorId: t.floorId })}>
+          <img src=${t.url} alt="" />
+          <span>${names.get(t.floorId) ?? ""}</span>
+        </button>`,
+      )}
+    </nav>`;
+  }
+
+  /** Long press: the quick menu at the device, or the details for devices without one. */
+  private onDeviceHold(entityId: string, x: number, y: number): void {
+    const kind = kindOf(entityId);
+    if (kind === "light" || kind === "cover" || kind === "switch" || kind === "fan" || kind === "lock" || kind === "camera") this._menu = { entity: entityId, x, y };
+    else openMoreInfo(this, entityId);
+  }
+
+  /** Swipe up or down on a lamp (brightness) or a blind (position). */
+  private onDeviceSwipe(entityId: string, phase: "start" | "move" | "end", dy: number, x: number, y: number): boolean {
+    const st = this.hass?.states[entityId];
+    if (phase === "start") {
+      // devices that ask before switching are not moved by a swipe (it turns the view instead)
+      if (!st || isUnavailable(st) || this.confirmSet.has(entityId)) return false;
+      const kind = kindOf(entityId);
+      if (kind === "light" && lightAbilities(st).dim) {
+        const pct = st.state === "on" ? (typeof st.attributes.brightness === "number" ? Math.round((st.attributes.brightness as number) / 2.55) : 100) : 0;
+        this._swipe = { entity: entityId, kind: "light", start: pct, value: pct, x, y };
+        return true;
+      }
+      if (kind === "cover" && coverPositionable(st)) {
+        const pos = st.attributes.current_position as number;
+        this._swipe = { entity: entityId, kind: "cover", start: pos, value: pos, x, y };
+        return true;
+      }
+      return false;
+    }
+    const s = this._swipe;
+    if (!s || s.entity !== entityId) return false;
+    if (phase === "move") {
+      // the whole range over about 220 pixels; up = brighter / blind up
+      const value = Math.round(Math.min(100, Math.max(0, s.start - (dy / 220) * 100)));
+      if (value !== s.value) this._swipe = { ...s, value };
+      // at most a few calls per second while the finger moves
+      const now = performance.now();
+      if (now - this.swipeSent > 350) {
+        this.swipeSent = now;
+        this.applySwipe();
+      }
+    } else {
+      this.applySwipe();
+      clearTimeout(this.swipeTimer);
+      this.swipeTimer = setTimeout(() => (this._swipe = null), 700);
+    }
+    return true;
+  }
+
+  private applySwipe(): void {
+    const s = this._swipe;
+    if (!s || !this.hass) return;
+    if (s.kind === "light") {
+      if (s.value <= 0) void this.hass.callService("light", "turn_off", { entity_id: s.entity });
+      else void this.hass.callService("light", "turn_on", { entity_id: s.entity, brightness_pct: s.value });
+    } else void this.hass.callService("cover", "set_cover_position", { entity_id: s.entity, position: s.value });
+  }
+
+  /** Fly to a search result: rooms are selected, devices shown on their floor and flashing. */
+  private goTo(item: SearchItem): void {
+    this._find = null;
+    if (item.kind === "room") {
+      this.fire("room-tap", { floorId: item.floorId, roomId: item.roomId });
+      return;
+    }
+    if (this.floorId !== item.floorId) this.fire("floor-tap", { floorId: item.floorId });
+    // after the host has switched the floor (its own camera flight starts first)
+    setTimeout(() => this.viewer?.focus(item.floorId, item.x, item.z, item.y, item.entity), 120);
+  }
+
+  private renderAlerts() {
+    const b = this.building;
+    if (!this._alerts.length || !b) return nothing;
+    const shown = this._alerts.slice(0, 3);
+    return html`<div class="nc3d-alert-banner" role="alert">
+      ${shown.map((a) => html`<button class="nc3d-alert nc3d-alert-${a.kind}" title=${alertText(this.hass, b, a)} @click=${() => this.jumpTo(a)}>${alertText(this.hass, b, a)}</button>`)}
+      ${this._alerts.length > 3 ? html`<span class="nc3d-alert-more">+${this._alerts.length - 3}</span>` : nothing}
+    </div>`;
+  }
+
+  /** Scenes and scripts of the selected room's area as chips (while no panel lists them). */
+  private renderScenes() {
+    const b = this.building;
+    if (!this.scenes || !this.roomId || this.panelOpen || !b || !this.hass) return nothing;
+    const room = b.floors.flatMap((f) => f.rooms).find((r) => r.id === this.roomId);
+    const ids = room ? areaEntities(this.hass, room.area_id).filter((id) => kindOf(id) === "scene" || kindOf(id) === "script").slice(0, 6) : [];
+    if (!ids.length) return nothing;
+    const areaName = room?.area_id ? this.hass.areas?.[room.area_id]?.name : undefined;
+    return html`<div class="nc3d-scenes">
+      ${ids.map((id) => html`<button class="nc3d-chip" aria-pressed=${this._sceneFired === id} @click=${() => this.runScene(id)}>${entityName(this.hass, id, areaName)}</button>`)}
+    </div>`;
+  }
+
+  private renderFind() {
+    const b = this.building;
+    if (!b || !this.hass) return nothing;
+    if (this._find === null) {
+      return html`<button class="nc3d-find-btn" title=${translate(this.hass, "find")} aria-label=${translate(this.hass, "find")} @click=${() => (this._find = "")}>
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5" /><path d="M16 16l4.5 4.5" /></svg>
+      </button>`;
+    }
+    const results = searchItems((this.findIndex ??= searchIndex(this.hass, b)), this._find);
+    return html`<div class="nc3d-find">
+      <input
+        type="search"
+        placeholder=${translate(this.hass, "find_placeholder")}
+        .value=${this._find}
+        @input=${(e: Event) => (this._find = (e.target as HTMLInputElement).value)}
+        @keydown=${(e: KeyboardEvent) => {
+          if (e.key === "Escape") this._find = null;
+          if (e.key === "Enter" && results[0]) this.goTo(results[0]);
+        }}
+      />
+      <button class="nc3d-find-close" aria-label=${translate(this.hass, "close")} @click=${() => (this._find = null)}>✕</button>
+      ${this._find.trim()
+        ? html`<div class="nc3d-find-list">
+            ${results.length
+              ? results.map(
+                  (it) => html`<button @click=${() => this.goTo(it)}>
+                    <span class="nc3d-find-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d=${it.icon ? iconPath(it.icon) : "M4 10l8-6 8 6v10H4z"} /></svg></span>
+                    <span><b>${it.name}</b>${it.where ? html`<small>${it.where}</small>` : nothing}</span>
+                  </button>`,
+                )
+              : html`<p>${translate(this.hass, "find_none")}</p>`}
+          </div>`
+        : nothing}
+    </div>`;
+  }
+
+  private renderSwipe() {
+    const s = this._swipe;
+    if (!s || !this.hass) return nothing;
+    const off = s.kind === "light" && s.value <= 0;
+    return html`<div class="nc3d-swipe" style="left:${s.x}px;top:${s.y}px">
+      <span>${entityName(this.hass, s.entity)}</span>
+      <b>${off ? translate(this.hass, "swipe_off") : `${s.value} %`}</b>
+      <i><em style="height:${s.value}%"></em></i>
+    </div>`;
+  }
+
+  /** Look through a placed camera: the view flies into it and its live picture lies over the 3D view. */
+  lookThrough(entityId: string): void {
+    const v = this.viewer;
+    const b = this.building;
+    if (!v || !b) return;
+    if (!hasFeature("camera_cockpit")) {
+      this._menu = null;
+      this._proHint = "camera_cockpit";
+      return;
+    }
+    const floorId = b.floors.find((f) => f.placements.some((p) => p.entity_id === entityId))?.id;
+    if (!floorId) return;
+    this._menu = null;
+    if (!this._through) this._through = { entity: entityId, back: v.getView() };
+    else this._through = { ...this._through, entity: entityId };
+    this.watchCameras(true);
+    // another floor first opens (its own flight must not win over ours)
+    const wait = this.floorId === floorId ? 0 : 300;
+    if (wait) {
+      this.throughFloor = floorId;
+      this.fire("floor-tap", { floorId });
+    }
+    setTimeout(() => {
+      if (this._through?.entity === entityId && !this.viewer?.lookThrough(entityId)) this._through = null;
+    }, wait);
+  }
+
+  private endThrough(): void {
+    const t = this._through;
+    if (!t) return;
+    this._through = null;
+    this.viewer?.flyTo(t.back);
+  }
+
+  /** The hint shown when a Pro feature is used without the Pro pack. */
+  private renderProHint() {
+    if (!this._proHint || !this.hass) return nothing;
+    return html`<div class="nc3d-pro" role="dialog">
+      <b>${translate(this.hass, "pro_title")}</b>
+      <span>${translate(this.hass, `pro_feature_${this._proHint}` as I18nKey)}</span>
+      <span class="nc3d-sub">${translate(this.hass, "pro_locked")}</span>
+      <div>
+        <a class="nc3d-chip nc3d-chip-on" href=${shopUrl(this.hass.language)} target="_blank" rel="noopener">${translate(this.hass, "pro_shop")}</a>
+        <a class="nc3d-chip" href=${manualUrl(this.hass.language, this._proHint)} target="_blank" rel="noopener">${translate(this.hass, "manual_more")}</a>
+        <button class="nc3d-chip" @click=${() => ((this._proHint = null), this.fire("open-extensions", null))}>${translate(this.hass, "ext_tab")}</button>
+        <button class="nc3d-chip" @click=${() => (this._proHint = null)}>${translate(this.hass, "close")}</button>
+      </div>
+    </div>`;
+  }
+
+  private renderThrough() {
+    const t = this._through;
+    if (!t || !this.hass) return nothing;
+    const st = this.hass.states[t.entity];
+    const picture = st?.attributes.entity_picture as string | undefined;
+    const src = picture && !isUnavailable(st) ? (picture.startsWith("data:") ? picture : `${picture}${picture.includes("?") ? "&" : "?"}nc3d=${this.cameraTick}`) : null;
+    return html`<div class="nc3d-through" style="--nc3d-blend:${this._blend}">
+      ${src ? html`<img class="nc3d-through-img" src=${src} alt="" />` : nothing}
+      <div class="nc3d-through-bar">
+        <span class="nc3d-through-name">${entityName(this.hass, t.entity)}</span>
+        <input
+          type="range"
+          min="0"
+          max="100"
+          .value=${String(Math.round(this._blend * 100))}
+          aria-label=${translate(this.hass, "through_blend")}
+          @input=${(e: Event) => (this._blend = Number((e.target as HTMLInputElement).value) / 100)}
+        />
+        <button class="nc3d-chip" @click=${() => this.endThrough()}>${translate(this.hass, "through_back")}</button>
+      </div>
+    </div>`;
+  }
+
+  private renderMenu() {
+    const m = this._menu;
+    if (!m || !this.hass) return nothing;
+    const stage = this.renderRoot.querySelector(".nc3d-stage") as HTMLElement | null;
+    const w = stage?.clientWidth ?? 800;
+    const h = stage?.clientHeight ?? 600;
+    const left = Math.max(8, Math.min(w - 240, m.x - 116));
+    const top = Math.max(8, Math.min(h - 360, m.y - 170));
+    return html`<div class="nc3d-menu-backdrop" @click=${() => (this._menu = null)}></div>
+      <nc3d-quick-menu
+        style="left:${left}px;top:${top}px"
+        ?low=${this._low}
+        .hass=${this.hass}
+        .entity=${m.entity}
+        ?confirmSwitch=${this.confirmSet.has(m.entity)}
+        ?pro=${hasFeature("camera_cockpit")}
+        @close=${() => (this._menu = null)}
+        @camera-look=${(e: CustomEvent<{ entity: string }>) => this.lookThrough(e.detail.entity)}
+      ></nc3d-quick-menu>`;
+  }
+
+  private onDeviceTap(entityId: string, x = 0, y = 0): void {
+    if (entityId.startsWith("trail:")) return;
+    const kind = kindOf(entityId);
+    // blinds have no single on/off: a tap opens their quick menu (up, positions, stop, down); a camera shows its picture
+    if (kind === "cover" || kind === "camera") {
+      this._menu = { entity: entityId, x, y };
+      return;
+    }
+    if (kind && TOGGLE_KINDS.has(kind)) {
+      if (this.confirmSet.has(entityId) && !confirm(translate(this.hass, "confirm_switch", { name: entityName(this.hass, entityId) }))) return;
+      void toggleEntity(this.hass, entityId);
+    } else openMoreInfo(this, entityId);
+  }
+
+  resetView(): void {
+    this._through = null;
+    this.viewer?.resetView();
+  }
+
+  private fire(type: string, detail: unknown): void {
+    this.dispatchEvent(new CustomEvent(type, { detail, bubbles: true, composed: true }));
+  }
+
+  private toggleFlows(): void {
+    this._flows = !this._flows;
+    try {
+      localStorage.setItem("neoncasa3d.flows", this._flows ? "1" : "0");
+    } catch {
+      // private mode: the choice lasts for this page only
+    }
+    this.syncDevices(true);
+  }
+
+  private renderEnergy() {
+    const e = this._energy;
+    if (!SHOW_ENERGY || !e || this.roomId || !this.showEnergy) return nothing;
+    const t = (k: Parameters<typeof translate>[1]) => translate(this.hass, k);
+    const items: { cls: string; label: string; value: string }[] = [];
+    if (e.consumption !== null) items.push({ cls: "total", label: t("energy_consumption"), value: formatPower(this.hass, e.consumption) });
+    if (e.grid !== null) {
+      const exporting = e.grid < 0;
+      items.push({ cls: exporting ? "export" : "grid", label: t(exporting ? "energy_grid_export" : "energy_grid_import"), value: formatPower(this.hass, Math.abs(e.grid)) });
+    }
+    if (e.solar !== null) items.push({ cls: "solar", label: t("energy_solar"), value: formatPower(this.hass, e.solar) });
+    if (e.battery !== null || e.soc !== null) {
+      const parts = [e.battery !== null ? formatPower(this.hass, Math.abs(e.battery)) : null, e.soc !== null ? `${Math.round(e.soc)} %` : null].filter(Boolean);
+      items.push({ cls: "battery", label: t("energy_battery"), value: parts.join(" · ") });
+    }
+    if (e.tariff) items.push({ cls: "tariff", label: t("energy_tariff"), value: `${formatNumber(this.hass, e.tariff.value, 3)} ${e.tariff.unit}`.trim() });
+    return html`<div class="nc3d-energy" aria-live="off">
+      ${items.map((i) => html`<div class="nc3d-energy-item nc3d-energy-${i.cls}"><span>${i.label}</span><b>${i.value}</b></div>`)}
+      ${this.flows !== null
+        ? nothing
+        : html`<button class="nc3d-energy-item nc3d-flow-toggle" aria-pressed=${this._flows} title=${`${t("flows_hint")} (${t(this._flows ? "flow_on" : "flow_off")})`} aria-label=${t("flows")} @click=${() => this.toggleFlows()}>
+        <span>${t("flows")}</span><b>⚡</b>
+      </button>`}
+    </div>`;
+  }
+
+  private renderLegend() {
+    if (this.heatMode === "none") return nothing;
+    const scale = HEAT_SCALES[this.heatMode];
+    // temperatures are coloured in °C and shown in Home Assistant's unit
+    const temp = this.heatMode === "temperature";
+    const lo = temp ? fromCelsius(this.hass, scale.stops[0][0]) : scale.stops[0][0];
+    const hi = temp ? fromCelsius(this.hass, scale.stops[scale.stops.length - 1][0]) : scale.stops[scale.stops.length - 1][0];
+    const unit = temp ? tempUnit(this.hass) : scale.unit;
+    const t = (k: Parameters<typeof translate>[1]) => translate(this.hass, k);
+    return html`<div class="nc3d-legend">
+      <b>${t(`heat_${this.heatMode}`)}</b>
+      <span class="nc3d-legend-bar" style="background:${heatGradient(this.heatMode)}"></span>
+      <span class="nc3d-legend-range"><span>${formatNumber(this.hass, lo, 0)} ${unit}</span><span>${formatNumber(this.hass, hi, 0)} ${unit}</span></span>
+      ${this.heatValues.size ? nothing : html`<span class="nc3d-legend-none">${t("heat_none_found")}</span>`}
+    </div>`;
+  }
+
+  /** The sky colour behind the house right now (night: deep blue-black, day: lighter and bluer, clouds in between). */
+  private skyColor(): [number, number, number] {
+    const stage = STAGE[this.theme] ?? STAGE.neon;
+    const sky = this._sky;
+    return stage.night[0].map((v, i) => Math.round(v + (stage.day[0][i] - v) * sky)) as [number, number, number];
+  }
+
+  /** While a storm is reported the stage flashes now and then. */
+  private watchLightning(on: boolean): void {
+    if (!on) {
+      clearTimeout(this.flashTimer);
+      this.flashTimer = undefined;
+      return;
+    }
+    if (this.flashTimer) return;
+    const next = () => {
+      this.flashTimer = setTimeout(() => {
+        if (!document.hidden) {
+          this._flash = true;
+          setTimeout(() => (this._flash = false), 140);
+        }
+        next();
+      }, 5000 + Math.random() * 9000);
+    };
+    next();
+  }
+
+  protected render() {
+    const sky = this._sky;
+    const mix = (a: number[], b: number[]) => `rgb(${a.map((v, i) => Math.round(v + (b[i] - v) * sky)).join(",")})`;
+    const stage = STAGE[this.theme] ?? STAGE.neon;
+    const style = `--nc3d-sky:${mix(stage.night[0], stage.day[0])};--nc3d-ground:${mix(stage.night[1], stage.day[1])}`;
+    return html`<div
+      class="nc3d-stage ${this.roomLabels ? "" : "nc3d-no-room-names"} ${this._low ? "nc3d-low" : ""} ${this.panelOpen ? "nc3d-panel-open" : ""} ${this._alerts.length ? "nc3d-has-alerts" : ""} ${this._through ? "nc3d-through-on" : ""} ${this._flash ? "nc3d-flash" : ""}"
+      style=${style}
+    >
+      ${this._error ? html`<p class="nc3d-error">${this._error}</p>` : nothing} ${this.renderEnergy()} ${this.renderLegend()}
+      ${this.renderAlerts()} ${this.renderThumbs()} ${this.renderScenes()} ${this.renderFind()} ${this.renderSwipe()} ${this.renderThrough()} ${this.renderProHint()} ${this.renderMenu()}
+      ${this.showStats && this._stats
+        ? html`<span class="nc3d-stats"
+            ><b>${this._stats.fps ? translate(this.hass, "stats_fps", { fps: this._stats.fps, ms: this._stats.worstMs }) : translate(this.hass, "stats_idle")}</b>
+            ${this._stats.busy.length ? html`(${this._stats.busy.map((b) => translate(this.hass, `stats_busy_${b}` as I18nKey)).join(", ")})` : nothing} ·
+            ${translate(this.hass, "stats", { calls: this._stats.calls, tris: this._stats.triangles.toLocaleString() })} ·
+            ${translate(this.hass, this._stats.low ? "stats_low" : "stats_full", { r: formatNumber(this.hass, this._stats.pixelRatio, 2) })}</span
+          >`
+        : nothing}
+    </div>`;
+  }
+
+  static styles = [
+    tokens,
+    controls,
+    css`
+      :host {
+        display: block;
+        position: relative;
+        min-height: 200px;
+      }
+      .nc3d-alert-banner {
+        position: absolute;
+        left: 50%;
+        top: 10px;
+        transform: translateX(-50%);
+        display: flex;
+        justify-content: center;
+        gap: 6px;
+        max-width: calc(100% - 24px);
+        z-index: 4;
+      }
+      .nc3d-alert {
+        flex: 0 1 auto;
+        min-width: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        padding: 7px 14px 7px 12px;
+        border: 0;
+        border-left: 4px solid #ff3b4f;
+        border-radius: 12px;
+        background: var(--nc3d-chrome-solid);
+        color: var(--nc3d-text);
+        font: 600 13.5px var(--nc3d-font);
+        box-shadow: 0 0 18px rgba(255, 59, 79, 0.35);
+        cursor: pointer;
+        animation: nc3d-alert-pulse 1.2s ease-in-out infinite;
+      }
+      .nc3d-alert-water,
+      .nc3d-alert-window_rain {
+        border-left-color: #4fb3ff;
+        box-shadow: 0 0 18px rgba(79, 179, 255, 0.35);
+      }
+      .nc3d-alert-alarm_pending {
+        border-left-color: #ffb547;
+        box-shadow: 0 0 18px rgba(255, 181, 71, 0.35);
+      }
+      .nc3d-alert-more {
+        align-self: center;
+        color: var(--nc3d-muted);
+        font-size: 13px;
+      }
+      @keyframes nc3d-alert-pulse {
+        50% {
+          box-shadow: 0 0 4px transparent;
+        }
+      }
+      .nc3d-has-alerts .nc3d-energy {
+        top: 58px;
+      }
+      .nc3d-scenes {
+        position: absolute;
+        left: 60px;
+        right: 60px;
+        bottom: calc(10px + var(--nc3d-bottom-inset, 0px));
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 6px;
+        z-index: 2;
+        pointer-events: none;
+      }
+      .nc3d-scenes .nc3d-chip {
+        pointer-events: auto;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .nc3d-alert,
+        .nc3d-dev-found {
+          animation: none;
+        }
+      }
+      .nc3d-stage {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        container-type: size;
+        container-name: nc3d;
+        background: radial-gradient(ellipse at 50% 35%, var(--nc3d-sky, var(--nc3d-bg2)), var(--nc3d-ground, var(--nc3d-bg)) 72%);
+        transition: background 2s ease;
+      }
+      .nc3d-canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        touch-action: none;
+        cursor: grab;
+      }
+      .nc3d-canvas:active {
+        cursor: grabbing;
+      }
+      .nc3d-labels {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+      }
+      .nc3d-pin {
+        position: absolute;
+        left: 0;
+        top: 0;
+        pointer-events: auto;
+        font: 600 12.5px var(--nc3d-title-font);
+        color: var(--nc3d-text);
+        background: var(--nc3d-chrome);
+        border: 1px solid var(--nc3d-line);
+        border-radius: 10px;
+        padding: 5px 10px;
+        cursor: pointer;
+        white-space: nowrap;
+        backdrop-filter: blur(6px);
+        box-shadow: var(--nc3d-shadow);
+      }
+      .nc3d-pin-floor {
+        display: grid;
+        justify-items: start;
+        gap: 1px;
+        padding: 8px 14px;
+        border-radius: 12px;
+        background: var(--nc3d-accent);
+        color: var(--nc3d-accent-text);
+        border-color: transparent;
+        box-shadow: 0 0 22px rgba(55, 224, 255, 0.28);
+      }
+      .nc3d-pin-floor b {
+        font: 700 15px var(--nc3d-title-font);
+        letter-spacing: -0.01em;
+      }
+      .nc3d-pin-floor span {
+        font: 500 12px var(--nc3d-font);
+        opacity: 0.78;
+      }
+      .nc3d-dev {
+        position: absolute;
+        left: 0;
+        top: 0;
+        pointer-events: auto;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px;
+        border-radius: 999px;
+        border: 1px solid var(--nc3d-line);
+        background: var(--nc3d-chrome);
+        color: var(--nc3d-muted);
+        font: 600 12px var(--nc3d-font);
+        cursor: pointer;
+        white-space: nowrap;
+        backdrop-filter: blur(6px);
+        touch-action: manipulation;
+        -webkit-user-select: none;
+        user-select: none;
+        transition: opacity 0.2s ease;
+      }
+      .nc3d-dev-icon {
+        display: grid;
+        place-items: center;
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        background: rgba(91, 124, 255, 0.14);
+      }
+      .nc3d-dev[data-entity^="trail:"] {
+        padding: 2px 4px 2px 2px;
+        font-size: 11px;
+        border-color: rgba(55, 224, 255, 0.5);
+      }
+      .nc3d-dev[data-entity^="trail:"] .nc3d-dev-icon {
+        color: #37e0ff;
+      }
+      .nc3d-dev[data-entity^="trail:"] .nc3d-dev-text {
+        display: inline;
+      }
+      .nc3d-dev-text {
+        display: none;
+        padding-right: 6px;
+        color: var(--nc3d-text);
+        font-variant-numeric: tabular-nums;
+        max-width: 160px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .nc3d-dev-watt:empty {
+        display: none;
+      }
+      .nc3d-dev-watt {
+        padding: 1px 6px 1px 0;
+        color: #37e0ff;
+        font-variant-numeric: tabular-nums;
+        font-weight: 700;
+      }
+      .nc3d-dev-on .nc3d-dev-watt {
+        color: #2a1a00;
+      }
+      .nc3d-person {
+        position: absolute;
+        left: 0;
+        top: 0;
+        display: grid;
+        place-items: center;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        overflow: hidden;
+        background: #ff5fd2;
+        color: #fff;
+        font: 700 12px var(--nc3d-font);
+        box-shadow:
+          0 0 0 2px rgba(255, 95, 210, 0.45),
+          0 0 18px #ff5fd2;
+        pointer-events: auto;
+      }
+      .nc3d-person img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .nc3d-person[hidden] {
+        display: none;
+      }
+      .nc3d-no-room-names .nc3d-pin {
+        display: none !important;
+      }
+      /* tablet level: blur over the canvas and glowing shadows are expensive on weak GPUs */
+      .nc3d-stage.nc3d-low {
+        transition: none;
+      }
+      .nc3d-low .nc3d-pin,
+      .nc3d-low .nc3d-dev,
+      .nc3d-low .nc3d-dev-on,
+      .nc3d-low .nc3d-energy-item,
+      .nc3d-low .nc3d-find input,
+      .nc3d-low .nc3d-find-list,
+      .nc3d-low .nc3d-find-btn,
+      .nc3d-low .nc3d-swipe,
+      .nc3d-low .nc3d-thumb {
+        backdrop-filter: none;
+        box-shadow: none;
+        transition: none;
+      }
+      .nc3d-thumbs {
+        position: absolute;
+        left: 12px;
+        top: 50%;
+        transform: translateY(-50%);
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-height: calc(100% - 140px);
+        overflow-y: auto;
+        scrollbar-width: none;
+        z-index: 2;
+      }
+      .nc3d-thumb {
+        position: relative;
+        display: grid;
+        padding: 0;
+        width: 150px;
+        border: 1px solid var(--nc3d-line);
+        border-radius: 14px;
+        background: color-mix(in srgb, var(--nc3d-chrome) 70%, transparent);
+        color: var(--nc3d-text);
+        cursor: pointer;
+        overflow: hidden;
+        font: inherit;
+        box-shadow: var(--nc3d-shadow);
+        opacity: 0.72;
+        transition: opacity 0.15s, border-color 0.15s;
+      }
+      .nc3d-thumb:hover,
+      .nc3d-thumb[aria-pressed="true"] {
+        opacity: 1;
+      }
+      .nc3d-thumb[aria-pressed="true"] {
+        border-color: var(--nc3d-accent);
+        box-shadow: var(--nc3d-shadow), 0 0 0 1px var(--nc3d-accent), 0 0 18px rgba(55, 224, 255, 0.25);
+      }
+      .nc3d-thumb img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 4 / 3;
+      }
+      .nc3d-thumb span {
+        position: absolute;
+        left: 8px;
+        bottom: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
+      }
+      .nc3d-thumb-house {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+      }
+      .nc3d-thumb-house span {
+        position: static;
+        text-shadow: none;
+      }
+      .nc3d-thumbs-small .nc3d-thumb {
+        width: 104px;
+      }
+      .nc3d-find-btn {
+        position: absolute;
+        left: 12px;
+        bottom: calc(10px + var(--nc3d-bottom-inset, 0px));
+        width: 40px;
+        height: 40px;
+        display: grid;
+        place-items: center;
+        border: 0;
+        border-radius: 13px;
+        background: var(--nc3d-chrome);
+        color: var(--nc3d-text);
+        box-shadow: var(--nc3d-shadow);
+        cursor: pointer;
+      }
+      .nc3d-find {
+        position: absolute;
+        left: 12px;
+        bottom: calc(10px + var(--nc3d-bottom-inset, 0px));
+        width: min(340px, calc(100% - 24px));
+        display: flex;
+        flex-direction: column-reverse;
+        gap: 6px;
+        z-index: 3;
+      }
+      .nc3d-find input {
+        box-sizing: border-box;
+        width: 100%;
+        height: 42px;
+        padding: 0 42px 0 14px;
+        border: 1px solid var(--nc3d-line);
+        border-radius: 14px;
+        background: var(--nc3d-chrome);
+        color: var(--nc3d-text);
+        font: inherit;
+        font-size: 15px;
+        box-shadow: var(--nc3d-shadow);
+        backdrop-filter: blur(8px);
+      }
+      .nc3d-find-close {
+        position: absolute;
+        right: 6px;
+        bottom: 6px;
+        width: 30px;
+        height: 30px;
+        border: 0;
+        border-radius: 10px;
+        background: none;
+        color: var(--nc3d-muted);
+        cursor: pointer;
+      }
+      .nc3d-find-list {
+        display: grid;
+        padding: 6px;
+        border-radius: 14px;
+        background: var(--nc3d-chrome);
+        box-shadow: var(--nc3d-shadow);
+        backdrop-filter: blur(8px);
+      }
+      .nc3d-find-list button {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 10px;
+        border: 0;
+        border-radius: 10px;
+        background: none;
+        color: var(--nc3d-text);
+        text-align: left;
+        font: inherit;
+        cursor: pointer;
+      }
+      .nc3d-find-list button:hover,
+      .nc3d-find-list button:focus-visible {
+        background: rgba(127, 127, 127, 0.14);
+      }
+      .nc3d-find-list b {
+        display: block;
+        font-weight: 600;
+      }
+      .nc3d-find-list small,
+      .nc3d-find-list p {
+        color: var(--nc3d-muted);
+        font-size: 12px;
+        margin: 0;
+      }
+      .nc3d-find-list p {
+        padding: 8px 10px;
+      }
+      .nc3d-find-icon {
+        display: grid;
+        place-items: center;
+        width: 30px;
+        height: 30px;
+        border-radius: 10px;
+        background: rgba(127, 127, 127, 0.15);
+        flex: none;
+      }
+      .nc3d-find-icon svg {
+        width: 16px;
+        height: 16px;
+      }
+      .nc3d-swipe {
+        position: absolute;
+        transform: translate(-50%, calc(-100% - 28px));
+        display: grid;
+        grid-template-columns: auto auto;
+        align-items: center;
+        gap: 2px 12px;
+        padding: 8px 12px;
+        border-radius: 14px;
+        background: var(--nc3d-chrome);
+        box-shadow: var(--nc3d-shadow);
+        pointer-events: none;
+        white-space: nowrap;
+        z-index: 4;
+      }
+      .nc3d-swipe span {
+        font-size: 12px;
+        color: var(--nc3d-muted);
+      }
+      .nc3d-swipe b {
+        grid-row: 2;
+        font: 700 22px var(--nc3d-title-font);
+      }
+      .nc3d-swipe i {
+        grid-row: 1 / 3;
+        grid-column: 2;
+        position: relative;
+        width: 10px;
+        height: 44px;
+        border-radius: 5px;
+        background: rgba(127, 127, 127, 0.25);
+        overflow: hidden;
+      }
+      .nc3d-swipe em {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: var(--nc3d-warm);
+      }
+      .nc3d-menu-backdrop {
+        position: absolute;
+        inset: 0;
+        z-index: 5;
+      }
+      .nc3d-through {
+        position: absolute;
+        inset: 0;
+        z-index: 4;
+        pointer-events: none;
+      }
+      .nc3d-pro {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 6;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-width: 320px;
+        padding: 16px 18px;
+        border-radius: 14px;
+        background: var(--nc3d-chrome-solid);
+        border: 1px solid var(--nc3d-accent);
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+      }
+      .nc3d-pro div {
+        display: flex;
+        gap: 8px;
+      }
+      .nc3d-pro a {
+        text-decoration: none;
+      }
+      .nc3d-flash::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: 3;
+        background: rgba(225, 238, 255, 0.4);
+        pointer-events: none;
+      }
+      .nc3d-through-img {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        opacity: var(--nc3d-blend);
+      }
+      .nc3d-through-bar {
+        position: absolute;
+        left: 50%;
+        bottom: calc(var(--nc3d-bottom-inset, 0px) + 14px);
+        transform: translateX(-50%);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        max-width: calc(100% - 32px);
+        padding: 8px 10px 8px 16px;
+        border-radius: 999px;
+        background: var(--nc3d-chrome);
+        backdrop-filter: blur(12px);
+        border: 1px solid var(--nc3d-line);
+        pointer-events: auto;
+      }
+      .nc3d-through-name {
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .nc3d-through-bar input[type="range"] {
+        width: 140px;
+        accent-color: var(--nc3d-accent);
+      }
+      .nc3d-through-on :is(.nc3d-pin, .nc3d-dev, .nc3d-energy, .nc3d-legend, .nc3d-thumbs, .nc3d-scenes, .nc3d-find-btn, .nc3d-stats) {
+        display: none;
+      }
+      nc3d-quick-menu {
+        position: absolute;
+        z-index: 6;
+      }
+      .nc3d-dev-found {
+        animation: nc3d-found 0.6s ease-in-out 4;
+      }
+      @keyframes nc3d-found {
+        50% {
+          scale: 1.35;
+          filter: drop-shadow(0 0 12px var(--nc3d-accent));
+        }
+      }
+      .nc3d-legend {
+        position: absolute;
+        left: 12px;
+        bottom: calc(60px + var(--nc3d-bottom-inset, 0px));
+        display: grid;
+        gap: 4px;
+        min-width: 180px;
+        padding: 8px 11px;
+        border-radius: 12px;
+        background: var(--nc3d-chrome);
+        box-shadow: var(--nc3d-shadow);
+        font-size: 12px;
+        pointer-events: none;
+      }
+      .nc3d-legend-bar {
+        height: 8px;
+        border-radius: 4px;
+      }
+      .nc3d-legend-range {
+        display: flex;
+        justify-content: space-between;
+        color: var(--nc3d-muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .nc3d-legend-none {
+        color: var(--nc3d-warm);
+      }
+      .nc3d-energy {
+        position: absolute;
+        left: 12px;
+        top: 10px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        max-width: calc(100% - 24px);
+        pointer-events: none;
+      }
+      .nc3d-energy-item {
+        display: grid;
+        padding: 5px 11px 6px;
+        border-radius: 12px;
+        background: var(--nc3d-chrome);
+        border-left: 3px solid var(--nc3d-line);
+        box-shadow: var(--nc3d-shadow);
+        backdrop-filter: blur(6px);
+        font-variant-numeric: tabular-nums;
+      }
+      .nc3d-energy-item span {
+        font-size: 11px;
+        color: var(--nc3d-muted);
+      }
+      .nc3d-energy-item b {
+        font: 700 15px var(--nc3d-title-font);
+      }
+      .nc3d-energy-total {
+        border-left-color: #6fd8ff;
+      }
+      .nc3d-energy-grid {
+        border-left-color: #37e0ff;
+      }
+      .nc3d-energy-export,
+      .nc3d-energy-solar {
+        border-left-color: #ffc633;
+      }
+      .nc3d-energy-battery {
+        border-left-color: #59ff8c;
+      }
+      .nc3d-flow-toggle {
+        pointer-events: auto;
+        cursor: pointer;
+        border: 0;
+        border-left: 3px solid var(--nc3d-line);
+        color: inherit;
+        text-align: left;
+        font: inherit;
+      }
+      .nc3d-flow-toggle[aria-pressed="true"] {
+        border-left-color: var(--nc3d-accent);
+      }
+      .nc3d-flow-toggle span {
+        display: none;
+      }
+      .nc3d-flow-toggle b {
+        opacity: 0.4;
+        filter: grayscale(1);
+      }
+      .nc3d-flow-toggle[aria-pressed="true"] b {
+        opacity: 1;
+        filter: none;
+      }
+      .nc3d-energy-tariff {
+        border-left-color: #b98cff;
+      }
+      /* narrow stages (portrait tablets, phones): the energy values scroll in one row */
+      @container nc3d (max-width: 900px) {
+        .nc3d-energy {
+          flex-wrap: nowrap;
+          overflow-x: auto;
+          scrollbar-width: none;
+          pointer-events: auto;
+        }
+        .nc3d-legend {
+          bottom: auto;
+          top: 62px;
+        }
+        .nc3d-has-alerts .nc3d-legend {
+          top: 110px;
+        }
+      }
+      /* a room sheet covers the lower half: the view's own controls step aside */
+      @container nc3d ((max-width: 700px) or ((orientation: portrait) and (max-width: 1000px))) {
+        .nc3d-panel-open :is(.nc3d-find-btn, .nc3d-find, .nc3d-thumbs, .nc3d-legend, .nc3d-stats, .nc3d-scenes) {
+          display: none;
+        }
+      }
+      @media (pointer: coarse) {
+        .nc3d-find-close {
+          width: 40px;
+          height: 40px;
+          right: 1px;
+          bottom: 1px;
+        }
+        .nc3d-dev {
+          padding: 6px;
+        }
+        .nc3d-pin {
+          padding: 8px 12px;
+        }
+      }
+      .nc3d-dev-full .nc3d-dev-text {
+        display: inline;
+      }
+      .nc3d-dev-sel {
+        outline: 2px solid var(--nc3d-accent);
+        outline-offset: 2px;
+      }
+      .nc3d-dev-on {
+        color: #2a1a00;
+        border-color: transparent;
+        background: var(--nc3d-glow, var(--nc3d-warm));
+        box-shadow: 0 0 16px var(--nc3d-glow, var(--nc3d-warm));
+      }
+      .nc3d-dev-on .nc3d-dev-icon {
+        background: rgba(255, 255, 255, 0.28);
+      }
+      .nc3d-dev-on .nc3d-dev-text {
+        color: #2a1a00;
+      }
+      .nc3d-dev-na {
+        opacity: 0.45;
+      }
+      .nc3d-dev-dim {
+        opacity: 0.35;
+      }
+      .nc3d-dev[hidden],
+      .nc3d-pin[hidden] {
+        display: none;
+      }
+      .nc3d-pin-active {
+        background: var(--nc3d-accent);
+        color: var(--nc3d-accent-text);
+        border-color: transparent;
+        box-shadow: 0 0 18px rgba(55, 224, 255, 0.45);
+      }
+      .nc3d-stats b {
+        color: var(--nc3d-accent);
+        font-weight: 700;
+      }
+      .nc3d-stats {
+        padding: 4px 9px;
+        border-radius: 8px;
+        background: var(--nc3d-chrome);
+        position: absolute;
+        right: 10px;
+        bottom: calc(8px + var(--nc3d-bottom-inset, 0px));
+        font-size: 11.5px;
+        color: var(--nc3d-muted);
+        font-variant-numeric: tabular-nums;
+        pointer-events: none;
+      }
+      .nc3d-error {
+        position: absolute;
+        inset: auto 16px 16px;
+        color: var(--nc3d-danger);
+      }
+    `,
+  ];
+}
+
+if (!customElements.get("nc3d-view3d")) customElements.define("nc3d-view3d", Fp3dView3d);
+
+/** Power as "850 W" or "1,2 kW". */
+function formatPower(hass: HomeAssistant | undefined, w: number): string {
+  return Math.abs(w) >= 1000 ? `${formatNumber(hass, w / 1000, 1)} kW` : `${Math.round(w)} W`;
+}
+
+/** Marker height above furniture: in front of a screen, above wall units, else just above the top. */
+function markerHeight(f: Furniture): number {
+  if (f.type === "tv_board") return f.h + 0.9;
+  // wall TV and wall cabinet: above the item (their height above the floor comes from mountBase)
+  if (f.type === "tv_wall" || f.type === "kitchen_wall") return f.h + 0.25;
+  return f.h + 0.35;
+}
