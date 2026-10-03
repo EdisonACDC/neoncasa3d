@@ -23,7 +23,7 @@ export interface Room {
   floor_material: string;
   /** Entities shown in the room's panel although they are not in the plan. */
   panel?: string[];
-  /** Height of the wall on each edge (index = edge points[i] -> points[i + 1]); null = full floor height. */
+  /** Height of the wall on each edge (index = edge points[i] -> points[i + 1]); null = full floor height, 0 = no wall. */
   wall_heights?: (number | null)[];
 }
 
@@ -97,6 +97,8 @@ export interface Furniture {
   d: number;
   h: number;
   variant: string | null;
+  /** Own name (e.g. "Wechselrichter Nord"); null = the type's name. */
+  name?: string | null;
   /** Linked entity, e.g. the TV's media player (null = automatic, "none" = none). */
   entity?: EntityRef;
   /** Power sensor (null = automatic: the linked entity's device or a matching name). */
@@ -249,6 +251,10 @@ export interface RoofSettings {
   strings?: SolarString[];
   /** Roof windows on the roof faces. */
   windows?: RoofWindow[];
+  /** Energie Pro: the hologram's place and size. */
+  hologram?: HologramSettings | null;
+  /** Energie Pro: cables laid by hand (the others find their own way). */
+  cables?: CableRoute[];
 }
 
 /**
@@ -298,6 +304,32 @@ export interface SolarField {
  * A roof window on a roof face (u along the eave, v up the slope, in metres, at its lower left corner). Like a
  * window it follows a contact (open or tilted: the sash swings out at the top) and a blind (cover).
  */
+/** Energie Pro: where the hologram hangs – on a solar field, moved along the field and up the slope, scaled. */
+export interface HologramSettings {
+  /** The field it hangs on (null: the biggest one). */
+  field: string | null;
+  /** Size factor (1 = normal). */
+  size: number;
+  /** Offset from the field's middle along the eave (m, + = right) and up the slope (m). */
+  right: number;
+  up: number;
+}
+
+export const DEFAULT_HOLOGRAM: HologramSettings = { field: null, size: 1, right: 0, up: 0 };
+
+/**
+ * Energie Pro: a cable laid by hand. Its id names the cable ("solar:<field>", "inv:<inverter>", "bat:<battery>",
+ * "grid"); the points are its way in the plan, run at `height` above the given floor.
+ */
+export interface CableRoute {
+  id: string;
+  floor_id: string;
+  points: Vec2[];
+  height: number;
+  /** Fixed: its points cannot be moved by accident. */
+  locked?: boolean;
+}
+
 export interface RoofWindow {
   id: string;
   face: string;
@@ -338,6 +370,15 @@ export interface BuildingSettings {
   rain_warning?: boolean;
   /** Plan lock: rooms, walls, doors, windows and outdoor areas cannot be moved by accident. */
   lock_plan?: boolean;
+  /** The camera the house view opens with (3D view, card, kiosk); null = fitted from the front left. */
+  start_view?: StartView | null;
+}
+
+/** A camera position around the house: azimuth and polar angle (radians) and the distance (m). */
+export interface StartView {
+  theta: number;
+  phi: number;
+  radius: number;
 }
 
 /**
@@ -396,6 +437,8 @@ export interface EnergySettings {
   battery: string | null;
   battery_invert: boolean;
   battery_soc: string | null;
+  /** House consumption (W); null = from the balance of grid, solar and battery. */
+  consumption: string | null;
   tariff: string | null;
 }
 
@@ -421,6 +464,7 @@ export const DEFAULT_ENERGY: EnergySettings = {
   battery: null,
   battery_invert: false,
   battery_soc: null,
+  consumption: null,
   tariff: null,
 };
 
@@ -558,6 +602,8 @@ export const FURNITURE_TYPES = [
   "inverter",
   "home_battery",
   "wallbox",
+  "meter",
+  "grid_point",
   "parking",
   "fridge_smart",
   "stairwell",
@@ -576,7 +622,7 @@ export const FURNITURE_GROUPS: Record<string, FurnitureType[]> = {
 };
 
 /** Energy devices: placed and set up in the Energy tool (stored like furniture, not in the library). */
-export const ENERGY_DEVICES = ["inverter", "home_battery", "wallbox"] as const;
+export const ENERGY_DEVICES = ["meter", "inverter", "home_battery", "wallbox", "grid_point"] as const;
 
 /** Furniture that can show a linked entity (TV state, power, …). */
 /** Lamps: drawn live (they glow with their light) and tapped directly in 3D. */
@@ -658,8 +704,11 @@ export function step(p: Vec2, length: number, dir: Direction): Vec2 {
  * Height of the bottom of a built-in model as drawn (a wall cabinet hangs at 1.45 m, a wall TV is
  * centred at 1.3 m, a radiator stands on short brackets); the mount height replaces it.
  */
-export function builtinBase(f: Pick<Furniture, "type" | "h">): number {
+export function builtinBase(f: Pick<Furniture, "type" | "h"> & { variant?: string | null }): number {
   switch (f.type) {
+    case "home_battery":
+      // a wall battery hangs at hip height
+      return f.variant === "wall" ? 0.5 : 0;
     case "kitchen_wall":
       return 1.45;
     case "tv_wall":
@@ -670,6 +719,8 @@ export function builtinBase(f: Pick<Furniture, "type" | "h">): number {
       return 1.1;
     case "wallbox":
       return 1.0;
+    case "meter":
+      return 0.4;
     default:
       return 0;
   }
@@ -691,6 +742,7 @@ export const ELECTRIC_FURNITURE = new Set<string>([
   "inverter",
   "home_battery",
   "wallbox",
+  "meter",
   "tv_board",
   "tv_wall",
   "desk",
@@ -725,6 +777,10 @@ export const FURNITURE_SIZE: Record<FurnitureType, [number, number, number]> = {
   inverter: [0.5, 0.2, 0.65],
   home_battery: [0.6, 0.25, 1.1],
   wallbox: [0.3, 0.15, 0.42],
+  // the meter cabinet hangs on the wall as well
+  meter: [0.55, 0.21, 1.1],
+  // the grid connection: a small street cabinet at the edge of the plot
+  grid_point: [0.4, 0.22, 0.6],
   fridge: [0.6, 0.65, 1.8],
   fridge_smart: [0.91, 0.73, 1.78],
   stairwell: [1.0, 2.6, 0.02],
