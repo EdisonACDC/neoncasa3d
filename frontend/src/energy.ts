@@ -1,0 +1,430 @@
+// Energy flow: power values from Home Assistant, the consumers placed in the plan, and the cable
+// routes from the meter along the wall bases to every consumer. Pure functions, no three.js.
+//
+// Routing: every room gets a "cable ring" just inside its walls; rings of neighbouring rooms are
+// linked through the middle of their shared walls. The meter, the consumers and the risers to other
+// floors are attached to the nearest ring. Dijkstra from the meter gives a tree; the power of all
+// consumers behind a cable is added up, so trunk lines carry more than branches.
+
+import { generateWalls } from "./geometry/walls.ts";
+import type { Building, Floor, Room, Vec2 } from "./model.ts";
+import { powerSensorsOf } from "./devices.ts";
+import { pointInPolygon, signedArea } from "./model.ts";
+import type { HassEntity, HomeAssistant } from "./types.ts";
+
+export type FlowKind = "consumer" | "grid" | "export" | "solar" | "battery";
+
+/** One straight piece of glowing cable (floor-local coordinates, y up from the floor). */
+export interface FlowSegment {
+  floorId: string;
+  a: [number, number, number];
+  b: [number, number, number];
+  /** Cable length from the source to `a`, so the stripes run on continuously. */
+  dist: number;
+  /** Power carried (W, >= 0); the flow runs from a to b. */
+  power: number;
+  kind: FlowKind;
+}
+
+export interface EnergySummary {
+  /** Grid power (W): positive = import, negative = export. */
+  grid: number | null;
+  solar: number | null;
+  /** Battery power (W): positive = discharging, negative = charging. */
+  battery: number | null;
+  soc: number | null;
+  tariff: { value: number; unit: string } | null;
+  /** House consumption (W) from the balance, or the sum of the consumers. */
+  consumption: number | null;
+}
+
+export interface Consumer {
+  /** Placed entity (device) id. */
+  id: string;
+  powerEntity: string;
+  floorId: string;
+  x: number;
+  z: number;
+  power: number;
+}
+
+const CABLE_Y = 0.03;
+/** Distance of the cable ring from the wall face. */
+const RING_GAP = 0.07;
+
+// ------------------------------------------------------------------ values
+
+/** Power in watts (kW and MW converted); null when unknown. */
+export function readPower(st: HassEntity | undefined, invert = false): number | null {
+  if (!st) return null;
+  const v = Number(st.state);
+  if (!Number.isFinite(v)) return null;
+  const unit = String(st.attributes.unit_of_measurement ?? "W");
+  const w = unit === "kW" ? v * 1000 : unit === "MW" ? v * 1e6 : v;
+  return invert ? -w : w;
+}
+
+function isPowerSensor(hass: HomeAssistant, id: string): boolean {
+  return id.startsWith("sensor.") && hass.states[id]?.attributes.device_class === "power";
+}
+
+/** Power sensor of a placed entity: the entity itself, or a power sensor of the same device. */
+export function powerSensorFor(hass: HomeAssistant, entityId: string): string | null {
+  if (isPowerSensor(hass, entityId)) return entityId;
+  const device = hass.entities?.[entityId]?.device_id;
+  if (!device) return null;
+  return powerSensorsOf(hass, device).find((e) => e !== entityId) ?? null;
+}
+
+/** Placed entities that report power, with their position and current power. */
+export function findConsumers(hass: HomeAssistant, building: Building): Consumer[] {
+  const e = building.energy;
+  const sources = new Set([e.grid, e.solar, e.battery].filter(Boolean));
+  const out: Consumer[] = [];
+  const seen = new Set<string>();
+  for (const floor of building.floors) {
+    for (const pl of floor.placements) {
+      const sensor = powerSensorFor(hass, pl.entity_id);
+      if (!sensor || sources.has(sensor) || seen.has(sensor)) continue;
+      seen.add(sensor);
+      out.push({ id: pl.entity_id, powerEntity: sensor, floorId: floor.id, x: pl.x, z: pl.z, power: Math.max(0, readPower(hass.states[sensor]) ?? 0) });
+    }
+  }
+  return out;
+}
+
+export function energySummary(hass: HomeAssistant, building: Building, consumers: Consumer[]): EnergySummary {
+  const e = building.energy;
+  const grid = e.grid ? readPower(hass.states[e.grid], e.grid_invert) : null;
+  const solar = e.solar ? readPower(hass.states[e.solar]) : null;
+  const battery = e.battery ? readPower(hass.states[e.battery], e.battery_invert) : null;
+  const socState = e.battery_soc ? Number(hass.states[e.battery_soc]?.state) : NaN;
+  const tariffState = e.tariff ? hass.states[e.tariff] : undefined;
+  const tariffValue = Number(tariffState?.state);
+  let consumption: number | null = null;
+  if (grid !== null || solar !== null || battery !== null) consumption = Math.max(0, (grid ?? 0) + Math.max(0, solar ?? 0) + (battery ?? 0));
+  else if (consumers.length) consumption = consumers.reduce((s, c) => s + c.power, 0);
+  return {
+    grid,
+    solar: solar === null ? null : Math.max(0, solar),
+    battery,
+    soc: Number.isFinite(socState) ? socState : null,
+    tariff: tariffState && Number.isFinite(tariffValue) ? { value: tariffValue, unit: String(tariffState.attributes.unit_of_measurement ?? "") } : null,
+    consumption,
+  };
+}
+
+// ------------------------------------------------------------------ routing graph
+
+interface Graph {
+  pos: Vec2[];
+  adj: { to: number; w: number }[][];
+  /** Ring segments per room: [node a, node b]. */
+  rings: Map<string, [number, number][]>;
+}
+
+function addNode(g: Graph, p: Vec2): number {
+  g.pos.push(p);
+  g.adj.push([]);
+  return g.pos.length - 1;
+}
+
+function link(g: Graph, a: number, b: number): void {
+  const w = Math.hypot(g.pos[a][0] - g.pos[b][0], g.pos[a][1] - g.pos[b][1]);
+  g.adj[a].push({ to: b, w });
+  g.adj[b].push({ to: a, w });
+}
+
+/** Polygon moved inwards by a distance per edge (counter-clockwise input). */
+function insetPolygon(poly: Vec2[], dist: number[]): Vec2[] {
+  const n = poly.length;
+  const lines = poly.map((a, i) => {
+    const b = poly[(i + 1) % n];
+    const dx = b[0] - a[0];
+    const dz = b[1] - a[1];
+    const l = Math.hypot(dx, dz) || 1;
+    const nx = -dz / l;
+    const nz = dx / l; // left normal = inside for a counter-clockwise polygon
+    return { p: [a[0] + nx * dist[i], a[1] + nz * dist[i]] as Vec2, d: [dx / l, dz / l] as Vec2, n: [nx, nz] as Vec2 };
+  });
+  return poly.map((v, i) => {
+    const l1 = lines[(i - 1 + n) % n];
+    const l2 = lines[i];
+    const den = l1.d[0] * l2.d[1] - l1.d[1] * l2.d[0];
+    if (Math.abs(den) < 1e-6) return [v[0] + l2.n[0] * dist[i], v[1] + l2.n[1] * dist[i]];
+    const t = ((l2.p[0] - l1.p[0]) * l2.d[1] - (l2.p[1] - l1.p[1]) * l2.d[0]) / den;
+    return [l1.p[0] + l1.d[0] * t, l1.p[1] + l1.d[1] * t];
+  });
+}
+
+function ccwRoom(room: Room): { pts: Vec2[]; flipped: boolean } {
+  return signedArea(room.points) >= 0 ? { pts: room.points, flipped: false } : { pts: [...room.points].reverse(), flipped: true };
+}
+
+function buildGraph(floor: Floor, exterior: number, interior: number): Graph {
+  const g: Graph = { pos: [], adj: [], rings: new Map() };
+  const { walls } = generateWalls(floor.rooms, { exterior, interior }, floor.walls ?? []);
+  for (const room of floor.rooms) {
+    if (room.points.length < 3) continue;
+    const { pts, flipped } = ccwRoom(room);
+    const n = pts.length;
+    // interior walls sit on the room edge, so the ring keeps half their thickness away
+    const dist = pts.map((_, i) => {
+      const stored = flipped ? (n - 2 - i + n) % n : i;
+      const shared = walls.some((w) => !w.exterior && w.sources.some((s) => s.room_id === room.id && s.edge === stored));
+      return RING_GAP + (shared ? interior / 2 : 0);
+    });
+    const ring = insetPolygon(pts, dist).map((p) => addNode(g, p));
+    const segs: [number, number][] = ring.map((a, i) => [a, ring[(i + 1) % n]]);
+    for (const [a, b] of segs) link(g, a, b);
+    g.rings.set(room.id, segs);
+  }
+  // doorless links through the middle of every interior wall
+  for (const w of walls) {
+    if (w.exterior || !w.roomLeft || !w.roomRight) continue;
+    const m: Vec2 = [(w.a[0] + w.b[0]) / 2, (w.a[1] + w.b[1]) / 2];
+    const a = attach(g, w.roomLeft, m);
+    const b = attach(g, w.roomRight, m);
+    if (a !== null && b !== null) link(g, a, b);
+  }
+  return g;
+}
+
+/** New node at the point of a room's ring closest to p, linked to that segment's ends. */
+function attach(g: Graph, roomId: string, p: Vec2): number | null {
+  const segs = g.rings.get(roomId);
+  if (!segs) return null;
+  let best: { seg: [number, number]; q: Vec2; d: number } | null = null;
+  for (const seg of segs) {
+    const a = g.pos[seg[0]];
+    const b = g.pos[seg[1]];
+    const dx = b[0] - a[0];
+    const dz = b[1] - a[1];
+    const l2 = dx * dx + dz * dz || 1;
+    const t = Math.min(1, Math.max(0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dz) / l2));
+    const q: Vec2 = [a[0] + dx * t, a[1] + dz * t];
+    const d = Math.hypot(p[0] - q[0], p[1] - q[1]);
+    if (!best || d < best.d) best = { seg, q, d };
+  }
+  if (!best) return null;
+  const node = addNode(g, best.q);
+  link(g, node, best.seg[0]);
+  link(g, node, best.seg[1]);
+  return node;
+}
+
+/** Room containing p, or the one whose outline is nearest. */
+function roomAt(floor: Floor, p: Vec2): Room | null {
+  const rooms = floor.rooms.filter((r) => r.points.length >= 3);
+  const inside = rooms.find((r) => pointInPolygon(p, r.points));
+  if (inside) return inside;
+  let best: { room: Room; d: number } | null = null;
+  for (const r of rooms) {
+    for (const q of r.points) {
+      const d = Math.hypot(p[0] - q[0], p[1] - q[1]);
+      if (!best || d < best.d) best = { room: r, d };
+    }
+  }
+  return best?.room ?? null;
+}
+
+function dijkstra(g: Graph, source: number): { dist: number[]; prev: number[] } {
+  const dist = g.pos.map(() => Infinity);
+  const prev = g.pos.map(() => -1);
+  const done = g.pos.map(() => false);
+  dist[source] = 0;
+  // graphs are small (a few hundred nodes): a linear scan is fast enough
+  for (;;) {
+    let u = -1;
+    for (let i = 0; i < dist.length; i++) if (!done[i] && dist[i] < Infinity && (u < 0 || dist[i] < dist[u])) u = i;
+    if (u < 0) break;
+    done[u] = true;
+    for (const { to, w } of g.adj[u]) {
+      if (dist[u] + w < dist[to] - 1e-9) {
+        dist[to] = dist[u] + w;
+        prev[to] = u;
+      }
+    }
+  }
+  return { dist, prev };
+}
+
+// ------------------------------------------------------------------ flows
+
+export interface FlowInput {
+  building: Building;
+  consumers: Consumer[];
+  summary: EnergySummary;
+  /** Position of a placed battery (for the battery cable), if any. */
+  battery?: { floorId: string; x: number; z: number } | null;
+}
+
+/** Cable route independent of the current power: which targets each piece feeds. */
+interface PlannedSegment {
+  floorId: string;
+  a: [number, number, number];
+  b: [number, number, number];
+  dist: number;
+  /** Indices of the targets (consumers, then the battery) fed through this piece. */
+  members: number[];
+  kind: FlowKind;
+}
+
+interface Target {
+  floorId: string;
+  x: number;
+  z: number;
+  kind: FlowKind;
+}
+
+/** Routes per building object and target layout; power changes only re-weigh the planned pieces. */
+const planCache = new WeakMap<Building, Map<string, PlannedSegment[]>>();
+
+function planRoutes(building: Building, targets: Target[]): PlannedSegment[] {
+  const meter = building.energy.meter!;
+  const meterFloor = building.floors.find((f) => f.id === meter.floor_id)!;
+  const out: PlannedSegment[] = [];
+  const { wall_exterior: ext, wall_interior: int } = building.settings;
+  const riserDist = new Map<string, number>();
+  const byFloor = new Map<string, number[]>();
+  targets.forEach((t, i) => byFloor.set(t.floorId, [...(byFloor.get(t.floorId) ?? []), i]));
+  const floorsWithLoad = building.floors.filter((f) => byFloor.has(f.id));
+
+  // vertical risers at the meter position: power for every other floor goes through them
+  for (const f of floorsWithLoad) {
+    if (f.id === meterFloor.id) continue;
+    const up = f.elevation > meterFloor.elevation;
+    const members = byFloor.get(f.id)!;
+    const kind = members.every((m) => targets[m].kind === "battery") ? "battery" : "consumer";
+    // on the meter floor: straight up to the ceiling (or down into the slab)
+    out.push({ floorId: meterFloor.id, a: [meter.x, CABLE_Y, meter.z], b: [meter.x, up ? meterFloor.height : -0.2, meter.z], dist: 0, members, kind });
+    // on the other floor: up out of the slab (or down from the ceiling) to the floor
+    const h = Math.abs(f.elevation - meterFloor.elevation);
+    out.push({ floorId: f.id, a: [meter.x, up ? -0.2 : f.height, meter.z], b: [meter.x, CABLE_Y, meter.z], dist: h, members, kind });
+    riserDist.set(f.id, h + 0.25);
+  }
+
+  for (const f of floorsWithLoad) {
+    const g = buildGraph(f, ext, int);
+    const rootRoom = roomAt(f, [meter.x, meter.z]);
+    if (!rootRoom) continue;
+    const root = addNode(g, [meter.x, meter.z]);
+    const rootAttach = attach(g, rootRoom.id, [meter.x, meter.z]);
+    if (rootAttach === null) continue;
+    link(g, root, rootAttach);
+    const ends: { node: number; member: number }[] = [];
+    for (const i of byFloor.get(f.id)!) {
+      const t = targets[i];
+      const room = roomAt(f, [t.x, t.z]);
+      if (!room) continue;
+      const node = addNode(g, [t.x, t.z]);
+      const at = attach(g, room.id, [t.x, t.z]);
+      if (at === null) continue;
+      link(g, node, at);
+      ends.push({ node, member: i });
+    }
+    const { dist, prev } = dijkstra(g, root);
+    // collect the targets behind every edge of the tree
+    const edges = new Map<string, { a: number; b: number; members: number[] }>();
+    for (const e of ends) {
+      if (!Number.isFinite(dist[e.node])) continue;
+      for (let v = e.node; prev[v] >= 0; v = prev[v]) {
+        const u = prev[v];
+        const key = `${u}>${v}`;
+        const cur = edges.get(key) ?? { a: u, b: v, members: [] };
+        cur.members.push(e.member);
+        edges.set(key, cur);
+      }
+    }
+    const base = riserDist.get(f.id) ?? 0;
+    for (const { a, b, members } of edges.values()) {
+      const pa = g.pos[a];
+      const pb = g.pos[b];
+      // a cable shared by the battery and consumers is drawn as consumer cable
+      const kind = members.every((m) => targets[m].kind === "battery") ? "battery" : "consumer";
+      out.push({ floorId: f.id, a: [pa[0], CABLE_Y, pa[1]], b: [pb[0], CABLE_Y, pb[1]], dist: base + dist[a], members, kind });
+    }
+  }
+  return out;
+}
+
+/** All cable segments: consumers (tree from the meter), grid feed, solar riser and battery cable. */
+export function flowSegments({ building, consumers, summary, battery }: FlowInput): FlowSegment[] {
+  const meter = building.energy.meter;
+  if (!meter) return [];
+  const meterFloor = building.floors.find((f) => f.id === meter.floor_id);
+  if (!meterFloor) return [];
+  const { wall_exterior: ext, wall_interior: int } = building.settings;
+
+  const targets: (Target & { power: number })[] = consumers.map((c) => ({ floorId: c.floorId, x: c.x, z: c.z, kind: "consumer" as FlowKind, power: c.power }));
+  if (battery && summary.battery !== null) targets.push({ ...battery, kind: "battery", power: Math.abs(summary.battery) });
+  const key = `${meter.floor_id}:${meter.x},${meter.z}|${targets.map((t) => `${t.floorId}:${t.x},${t.z}:${t.kind}`).join(";")}`;
+  let perBuilding = planCache.get(building);
+  if (!perBuilding) planCache.set(building, (perBuilding = new Map()));
+  let plan = perBuilding.get(key);
+  if (!plan) {
+    plan = planRoutes(building, targets);
+    // one layout per building is enough (a new building object comes with every edit)
+    perBuilding.clear();
+    perBuilding.set(key, plan);
+  }
+  const out: FlowSegment[] = plan.map((s) => ({
+    floorId: s.floorId,
+    a: s.a,
+    b: s.b,
+    dist: s.dist,
+    power: s.members.reduce((sum, m) => sum + targets[m].power, 0),
+    kind: s.kind,
+  }));
+
+  // grid feed: from outside through the nearest exterior wall to the meter
+  if (summary.grid !== null) {
+    const { walls } = generateWalls(meterFloor.rooms, { exterior: ext, interior: int }, meterFloor.walls ?? []);
+    let best: { q: Vec2; out: Vec2; d: number } | null = null;
+    for (const w of walls) {
+      if (!w.exterior) continue;
+      const dx = w.b[0] - w.a[0];
+      const dz = w.b[1] - w.a[1];
+      const l2 = dx * dx + dz * dz || 1;
+      const t = Math.min(1, Math.max(0, ((meter.x - w.a[0]) * dx + (meter.z - w.a[1]) * dz) / l2));
+      const q: Vec2 = [w.a[0] + dx * t, w.a[1] + dz * t];
+      const d = Math.hypot(meter.x - q[0], meter.z - q[1]);
+      const l = Math.sqrt(l2);
+      if (!best || d < best.d) best = { q, out: [dz / l, -dx / l], d };
+    }
+    if (best) {
+      const far: [number, number, number] = [best.q[0] + best.out[0] * (ext + 1.4), CABLE_Y, best.q[1] + best.out[1] * (ext + 1.4)];
+      const at: [number, number, number] = [meter.x, CABLE_Y, meter.z];
+      const importing = summary.grid >= 0;
+      out.push({ floorId: meterFloor.id, a: importing ? far : at, b: importing ? at : far, dist: 0, power: Math.abs(summary.grid), kind: importing ? "grid" : "export" });
+    }
+  }
+  // solar: down from above the ceiling to the meter
+  if (summary.solar !== null) {
+    out.push({ floorId: meterFloor.id, a: [meter.x + 0.08, meterFloor.height + 0.6, meter.z + 0.08], b: [meter.x + 0.08, CABLE_Y, meter.z + 0.08], dist: 0, power: summary.solar, kind: "solar" });
+  }
+  // the battery cable flows towards the meter when discharging
+  if (summary.battery !== null && summary.battery > 0) {
+    for (const s of out) if (s.kind === "battery") [s.a, s.b] = [s.b, s.a];
+  }
+  return out;
+}
+
+/** Cable colour: grid import cyan, export and solar yellow, battery green; consumers by their main source. */
+export function flowColor(kind: FlowKind, summary: EnergySummary): [number, number, number] {
+  const CYAN: [number, number, number] = [0.22, 0.88, 1];
+  const YELLOW: [number, number, number] = [1, 0.78, 0.2];
+  const GREEN: [number, number, number] = [0.35, 1, 0.55];
+  if (kind === "grid") return CYAN;
+  if (kind === "export" || kind === "solar") return YELLOW;
+  if (kind === "battery") return GREEN;
+  // what feeds the house: grid import, the part of the sun not exported, battery discharge
+  const shares: [number, [number, number, number]][] = [
+    [Math.max(0, summary.grid ?? 0), CYAN],
+    [Math.max(0, (summary.solar ?? 0) - Math.max(0, -(summary.grid ?? 0)) - Math.max(0, -(summary.battery ?? 0))), YELLOW],
+    [Math.max(0, summary.battery ?? 0), GREEN],
+  ];
+  // mixed colours wash out to white on the dark floor, so the largest source wins
+  const [best] = shares.reduce((a, b) => (b[0] > a[0] ? b : a));
+  return best > 0 ? shares.find((s) => s[0] === best)![1] : CYAN;
+}

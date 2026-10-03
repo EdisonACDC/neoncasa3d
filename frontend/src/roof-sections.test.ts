@@ -1,0 +1,127 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { emptyBuilding, newFloor, type Room, type RoofSection } from "./model.ts";
+import { ridgeHeight, roofSectionsFromRooms, sectionFrame, sectionOverhang, sectionProfile, wallTopUnder } from "./roof-sections.ts";
+import { buildRoof } from "./viewer/roof.ts";
+
+const near = (a: number, b: number, eps = 1e-6) => assert.ok(Math.abs(a - b) < eps, `${a} != ${b}`);
+const rect = (id: string, x0: number, z0: number, x1: number, z1: number): Room => ({ id, name: id, area_id: null, points: [[x0, z0], [x1, z0], [x1, z1], [x0, z1]], floor_material: "wood" });
+const section = (patch: Partial<RoofSection> = {}): RoofSection => ({
+  id: "s",
+  x0: 0,
+  z0: 0,
+  x1: 12,
+  z1: 8,
+  shape: "gable",
+  axis: "x",
+  eave_a: 3,
+  eave_b: 3,
+  pitch_a: 45,
+  pitch_b: 45,
+  base: 3,
+  ...patch,
+});
+
+test("a symmetric gable has its ridge in the middle, half the width up", () => {
+  const p = sectionProfile(section());
+  near(p.vr, 4);
+  near(p.rh, 7);
+  near(p.y(0), 3);
+  near(p.y(8), 3);
+  // beyond the wall (the overhang) the slope goes on down
+  near(p.y(-0.5), 2.5);
+});
+
+test("a lower eave on one side (a catslide) moves the ridge and keeps both slopes", () => {
+  // side b reaches 2 m lower at the same pitch: the ridge moves 1 m towards side a
+  const p = sectionProfile(section({ eave_b: 1 }));
+  near(p.vr, 3);
+  near(p.rh, 6);
+  near(p.y(8), 1);
+  near(ridgeHeight(section({ eave_b: 1 })), 6);
+});
+
+test("a pent roof rises from side a to its high edge at side b, a flat roof stays at its eave", () => {
+  const pent = sectionProfile(section({ shape: "pent", pitch_a: 20 }));
+  near(pent.vr, 8);
+  near(pent.rh, 3 + 8 * Math.tan((20 * Math.PI) / 180));
+  near(sectionProfile(section({ shape: "flat" })).rh, 3);
+});
+
+test("the frame runs u along the ridge and v across from side a", () => {
+  const fx = sectionFrame(section());
+  assert.deepEqual([fx.u0, fx.u1, fx.w], [0, 12, 8]);
+  assert.deepEqual(fx.at(2, 1), [2, 1]);
+  const fz = sectionFrame(section({ axis: "z" }));
+  assert.deepEqual([fz.u0, fz.u1, fz.w], [0, 8, 12]);
+  assert.deepEqual(fz.at(2, 1), [1, 2]);
+});
+
+test("sections proposed from an L-shaped house and a single-storey part", () => {
+  const b = emptyBuilding();
+  b.settings.wall_exterior = 0.25;
+  // ground floor: an L (barn 16 × 10, living wing 8 × 10 at a right angle); upper floor over the wing only
+  b.floors = [
+    { ...newFloor("eg", "EG", 0), rooms: [rect("barn", 0, 0, 16, 10), rect("wing", 0, 10, 8, 20)] },
+    { ...newFloor("og", "OG", 2.75), rooms: [rect("up", 0, 10, 8, 20)] },
+  ];
+  const s = roofSectionsFromRooms(b);
+  assert.equal(s.length, 2);
+  // the upper floor first: the wing, ridge along its long side (z), eaves on its walls
+  assert.deepEqual([s[0].x0, s[0].z0, s[0].x1, s[0].z1, s[0].axis], [-0.25, 9.75, 8.25, 20.25, "z"]);
+  near(s[0].eave_a, 2.75 + 2.5);
+  // the ground floor: only the barn is left uncovered
+  assert.deepEqual([s[1].x0, s[1].z0, s[1].x1, s[1].z1, s[1].axis], [-0.25, -0.25, 16.25, 10.25, "x"]);
+  near(s[1].base, 2.5);
+  // a custom roof is drawn in parts per floor
+  b.settings.roof = { type: "custom", pitch: 40, overhang: 0.4, sections: s };
+  const parts = buildRoof(b);
+  assert.deepEqual(parts.map((p) => p.floor.id).sort(), ["eg", "og"]);
+  assert.ok(parts.every((p) => p.solid.count > 0));
+});
+
+test("every shape builds geometry", () => {
+  const b = emptyBuilding();
+  b.floors = [{ ...newFloor("eg", "EG", 0), rooms: [rect("a", 0, 0, 12, 8)] }];
+  for (const shape of ["gable", "hip", "pent", "flat"] as const) {
+    b.settings.roof = { type: "custom", pitch: 40, overhang: 0.4, sections: [section({ shape, base: 2.5, eave_a: 2.5, eave_b: 2.5 })] };
+    const [part] = buildRoof(b);
+    assert.ok(part.solid.count > 0, shape);
+    // nothing reaches higher than the ridge, or the high edge of a pent roof over its overhang (plus a flat roof's thickness)
+    const sec = section({ shape, eave_a: 2.5, eave_b: 2.5 });
+    const top = Math.max(ridgeHeight(sec), sectionProfile(sec).y(8 + 0.4));
+    const ys = part.solid.p.filter((_, i) => i % 3 === 1);
+    assert.ok(Math.max(...ys) <= top + 0.26, shape);
+  }
+});
+
+test("a lean-to has no overhang where it meets the taller house, and sits on the walls below", () => {
+  const b = emptyBuilding();
+  // a two-storey house (0..10) and a single-storey garage beside it (10..14)
+  b.floors = [
+    { ...newFloor("eg", "EG", 0), rooms: [rect("house", 0, 0, 10, 8), rect("garage", 10, 0, 14, 6)] },
+    { ...newFloor("og", "OG", 2.75), rooms: [rect("up", 0, 0, 10, 8)] },
+  ];
+  near(wallTopUnder(b, 10, 0, 14, 6)!, 2.5);
+  near(wallTopUnder(b, 0, 0, 10, 8)!, 2.75 + 2.5);
+  // pent roof on the garage, ridge along z, side a at x = 10 (the house)
+  const lean = section({ x0: 10, z0: 0, x1: 14, z1: 6, shape: "pent", axis: "z", flip: true, eave_a: 2.5, eave_b: 2.5, base: 2.5 });
+  const o = sectionOverhang(b, lean, 0.4);
+  // flipped: side a is at x = 14 (open), side b at x = 10 against the house
+  assert.deepEqual([o.a, o.b, o.u0, o.u1], [0.4, 0, 0.4, 0.4]);
+});
+
+test("a canopy over a terrace draws see-through panels and posts instead of walls", () => {
+  const b = emptyBuilding();
+  b.floors = [{ ...newFloor("eg", "EG", 0), rooms: [rect("house", 0, 0, 10, 8)] }];
+  // a terrace roof in front of the house, rising to the house wall (side b at z = 8 … flipped: a = z 11)
+  const canopy = section({ x0: 2, z0: 8, x1: 8, z1: 11, shape: "pent", axis: "x", flip: true, eave_a: 2.4, eave_b: 2.4, pitch_a: 6, pitch_b: 6, base: 2.4, open: true });
+  b.settings.roof = { type: "custom", pitch: 35, overhang: 0.4, sections: [canopy] };
+  const [part] = buildRoof(b);
+  assert.ok(part.glass.count > 0, "see-through panels");
+  // the posts reach down to the ground
+  const ys = part.solid.p.filter((_, i) => i % 3 === 1);
+  near(Math.min(...ys), 0);
+  // the side at the house wall has no overhang
+  assert.equal(sectionOverhang(b, canopy, 0.15).b, 0);
+});
