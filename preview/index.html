@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NeonCasa 3D – Vorschau</title>
+    <style>
+      /* Like HA: the panel's parent has no explicit height, the panel sizes itself. */
+      body {
+        margin: 0;
+        background: #070b14;
+      }
+    </style>
+  </head>
+  <body>
+    <neoncasa3d-panel></neoncasa3d-panel>
+    <script type="module">
+      // Mock of the Home Assistant frontend object with invented demo data.
+      import { DEMO_AREAS, DEMO_BUILDING, DEMO_FLOORS, DEMO_PACK, DEMO_ENTITIES, DEMO_STATES, DEMO_PICTURES } from "./demo-data.js";
+
+      const params = new URLSearchParams(location.search);
+      // the shop connection of the demo: connected when ?shop is given, with one pack to install and one update
+      let license = {
+        instance: "3f9c2a7b1e4d8c05",
+        active: params.has("shop"),
+        key_hint: params.has("shop") ? "…7K2M" : null,
+        licensee: params.has("shop") ? "Demo Kunde" : null,
+        checked_at: params.has("shop") ? Date.now() / 1000 - 3600 : null,
+        error: null,
+        shop_url: "https://mastershort.de/neonplan3d/",
+        packs: [
+          { id: "mastershort.living", name: "Wohnzimmer", release: 2, url: "https://mastershort.de/neonplan3d/", installed: 1 },
+          { id: "mastershort.kitchen", name: "Küche", release: 1, url: "https://mastershort.de/neonplan3d/", installed: 1 },
+          { id: "mastershort.vehicles", name: "Fahrzeuge", release: 1, url: "https://mastershort.de/neonplan3d/", installed: null },
+        ],
+        // invented offers of the demo shop and a loyalty code
+        offers: params.has("shop")
+          ? [
+              { id: "kino", name: "Heimkino & Hi-Fi", teaser: "Leinwand, Beamer, Lautsprecher, Subwoofer – verknüpfbar", image: null, url: "https://mastershort.de/neonplan3d/", kind: "pack", price: "5,90 €", new: true },
+              { id: "tiere", name: "Haustiere", teaser: "Kratzbaum, Hundekorb, Aquarium mit Licht", image: null, url: "https://mastershort.de/neonplan3d/", kind: "pack", price: "3,90 €", new: true },
+              { id: "pro_weather", name: "Wetter draußen", teaser: "Regen, Schnee und Gewitter live am Haus", image: null, url: "https://mastershort.de/neonplan3d/", kind: "pro", price: "3,90 €", new: false },
+            ]
+          : [],
+        loyalty: params.has("shop") ? { code: "NP-TREUE-DEMO42", percent: 10 } : null,
+        updates: params.has("shop") ? [{ id: "mastershort.kitchen", name: "Küche", release: 2, added: 10, at: Date.now() / 1000 - 600 }] : [],
+      };
+      let building = params.has("empty") ? { version: 1, floors: [], settings: { wall_exterior: 0.24, wall_interior: 0.12, grid: 0.05 } } : DEMO_BUILDING;
+      let revision = 1;
+      const images = { ...DEMO_PICTURES };
+      const listeners = new Set();
+      // invented restore points
+      const history = [{ id: "s0", revision: 0, saved_at: Date.now() / 1000 - 3600, building: structuredClone(building) }];
+
+      // furniture packs: the invented demo pack, plus local pack sources from private/ (not in git)
+      let importedPacks = null;
+      async function previewPacks() {
+        if (importedPacks === null) {
+          importedPacks = [DEMO_PACK];
+          // the demo has NeonPlan Pro unless ?nopro asks for the locked look
+          if (!params.has("nopro")) importedPacks.push({ format: "fp3dpack", version: 1, id: "demo.pro", name: "NeonPlan Pro (Demo)", publisher: "Mastershort", licensee: null, features: ["camera_cockpit", "weather", "screens"], items: [] });
+          try {
+            const res = await fetch("../private/packs/starter.json");
+            if (res.ok) importedPacks.push({ licensee: null, ...(await res.json()) });
+            const index = await fetch("../private/packs/src/index.json");
+            for (const name of index.ok ? await index.json() : []) {
+              const pack = await fetch(`../private/packs/src/${name}`);
+              if (pack.ok) importedPacks.push({ licensee: null, ...(await pack.json()) });
+            }
+          } catch {
+            // no local packs
+          }
+        }
+        // ?nopro also drops local feature packs, so the locked look can be seen
+        return params.has("nopro") ? importedPacks.filter((p) => !p.features?.length) : importedPacks;
+      }
+
+      const hass = {
+        language: params.get("lang") || "de",
+        user: { is_admin: !params.has("user"), name: "Demo" },
+        areas: DEMO_AREAS,
+        floors: DEMO_FLOORS,
+        entities: DEMO_ENTITIES,
+        devices: {},
+        states: structuredClone(DEMO_STATES),
+        connection: {
+          async subscribeMessage(cb) {
+            listeners.add(cb);
+            return async () => listeners.delete(cb);
+          },
+        },
+        async callService(domain, service, data) {
+          // enough behaviour to see the effect of the room panel and of taps in 3D
+          const states = { ...current.states };
+          for (const id of [].concat(data?.entity_id ?? [])) {
+            const st = states[id];
+            if (!st) continue;
+            const next = { ...st, attributes: { ...st.attributes } };
+            const a = next.attributes;
+            const setOn = (on) => {
+              next.state = on ? "on" : "off";
+              if (domain === "light" && on && a.brightness === undefined) a.brightness = 200;
+              if (domain === "light" && !on) delete a.brightness;
+            };
+            if (service === "toggle") setOn(st.state !== "on");
+            else if (service === "turn_off") setOn(false);
+            else if (service === "turn_on" && domain === "light") {
+              setOn(true);
+              if (data.brightness_pct !== undefined) a.brightness = Math.round((data.brightness_pct / 100) * 255);
+              if (data.color_temp_kelvin !== undefined) Object.assign(a, { color_temp_kelvin: data.color_temp_kelvin, color_mode: "color_temp" });
+              if (data.rgb_color) Object.assign(a, { rgb_color: data.rgb_color, color_mode: "hs" });
+            } else if (service === "open_cover") {
+              next.state = "open";
+              a.current_position = 100;
+            } else if (service === "close_cover") {
+              next.state = "closed";
+              a.current_position = 0;
+            } else if (service === "set_cover_position") {
+              a.current_position = data.position;
+              next.state = data.position > 0 ? "open" : "closed";
+            } else if (service === "set_temperature") a.temperature = data.temperature;
+            else if (service === "set_hvac_mode") next.state = data.hvac_mode;
+            else if (service === "media_play_pause") next.state = st.state === "playing" ? "paused" : "playing";
+            else if (service === "volume_set") a.volume_level = data.volume_level;
+            states[id] = next;
+          }
+          current = { ...current, states };
+          if (window.nc3dCard) window.nc3dCard.hass = current;
+          else if (window.nc3dPanel) window.nc3dPanel.hass = current;
+        },
+        async callWS(msg) {
+          switch (msg.type) {
+            case "neoncasa3d/building/get":
+              return { building: structuredClone(building), revision };
+            case "neoncasa3d/building/save":
+              // ?savefail simulates a backend that still runs an older version
+              if (params.has("savefail")) throw { code: "invalid_format", message: "extra keys not allowed @ data['building']['floors'][0]['furniture'][0]['entity']" };
+              building = structuredClone(msg.building);
+              revision += 1;
+              for (const cb of listeners) cb({ revision });
+              return { revision };
+            case "neoncasa3d/history/list":
+              return { snapshots: history.map(({ building: b, ...rest }) => ({ ...rest, floors: b.floors.length, rooms: b.floors.reduce((n, f) => n + f.rooms.length, 0), furniture: b.floors.reduce((n, f) => n + f.furniture.length, 0) })).reverse() };
+            case "neoncasa3d/history/snapshot":
+              history.push({ id: `s${history.length + 1}`, revision, saved_at: Date.now() / 1000, building: structuredClone(building) });
+              return null;
+            case "neoncasa3d/history/restore": {
+              const snap = history.find((h) => h.id === msg.snapshot_id);
+              building = structuredClone(snap.building);
+              revision += 1;
+              for (const cb of listeners) cb({ revision });
+              return { revision };
+            }
+            case "neoncasa3d/image/get":
+              if (!images[msg.image_id]) throw { code: "not_found", message: "Image not found" };
+              return { data: images[msg.image_id] };
+            case "neoncasa3d/image/set":
+              images[msg.image_id] = msg.data;
+              return null;
+            case "neoncasa3d/packs/list":
+              return { packs: await previewPacks() };
+            case "neoncasa3d/packs/import": {
+              // the preview cannot check signatures: a file with a payload counts as valid
+              const data = JSON.parse(msg.pack);
+              if (!data.payload || !data.signature) throw { code: "unsigned", message: "unsigned" };
+              importedPacks = [...importedPacks.filter((p) => p.id !== data.payload.id), data.payload];
+              return { id: data.payload.id, name: data.payload.name, publisher: data.payload.publisher, licensee: data.payload.licensee ?? null, items: data.payload.items.length };
+            }
+            case "neoncasa3d/packs/remove":
+              importedPacks = importedPacks.filter((p) => p.id !== msg.pack_id);
+              return null;
+            case "neoncasa3d/license/get":
+              return license;
+            case "neoncasa3d/license/activate":
+              if (!/^NP(-[A-Z0-9]{4}){4}$/i.test(msg.key)) throw { code: "invalid_key", message: "unknown" };
+              license = { ...license, active: true, key_hint: "…" + msg.key.slice(-4), licensee: "Demo Kunde", checked_at: Date.now() / 1000 };
+              return license;
+            case "neoncasa3d/license/remove":
+              license = { ...license, active: false, key_hint: null, licensee: null, checked_at: null };
+              return license;
+            case "neoncasa3d/license/refresh":
+              license = { ...license, checked_at: Date.now() / 1000 };
+              return license;
+            case "neoncasa3d/packs/install":
+              license.packs = license.packs.map((p) => (p.id === msg.pack_id ? { ...p, installed: p.release } : p));
+              return { id: msg.pack_id, name: msg.pack_id, publisher: "Mastershort", licensee: "Demo Kunde", release: 1, items: 0 };
+            case "history/history_during_period": {
+              // invented motion of the last half hour: hall, kitchen, then the living-room camera
+              const now = Date.now() / 1000;
+              const on = (entity, ...minutesAgo) => [entity, minutesAgo.flatMap((m) => [{ s: "on", lu: now - m * 60 }, { s: "off", lu: now - m * 60 + 40 }])];
+              return Object.fromEntries([
+                on("binary_sensor.flur_bewegung", 26, 12),
+                on("binary_sensor.kueche_praesenz", 22, 9),
+                on("binary_sensor.wohnzimmer_kamera_bewegung", 17, 3),
+                on("binary_sensor.garage_auto", 28),
+              ]);
+            }
+            default:
+              throw { code: "unknown_command", message: msg.type };
+          }
+        },
+      };
+
+      if (params.has("weather")) {
+        // ?weather=pouring|snowy|fog|lightning-rainy|cloudy… sets the demo weather
+        hass.states["weather.zuhause"].state = params.get("weather");
+        hass.states["weather.zuhause"].attributes = { ...hass.states["weather.zuhause"].attributes, cloud_coverage: 85, wind_speed: 25, wind_speed_unit: "km/h" };
+      }
+      if (params.has("alerts")) {
+        // ?alerts: smoke in the kitchen while it rains on open windows
+        hass.states["binary_sensor.kueche_rauch"].state = "on";
+        hass.states["weather.zuhause"].state = "rainy";
+      }
+      let current = hass;
+      await import("../custom_components/neoncasa3d/frontend/neoncasa3d.js");
+      if (params.has("site")) {
+        // ?site: the public online demo says what it is and where to get NeonCasa 3D
+        const de = hass.language === "de";
+        // phones: short and at the top of the 3D area, clear of the toolbars at the bottom
+        const narrow = innerWidth < 700;
+        const bar = document.createElement("div");
+        bar.style.cssText =
+          (narrow ? "position:fixed;left:50%;top:244px;" : "position:fixed;left:50%;bottom:64px;") +
+          "transform:translateX(-50%);z-index:10;display:flex;gap:10px;align-items:center;flex-wrap:nowrap;white-space:nowrap;justify-content:center;max-width:calc(100vw - 32px);padding:8px 14px;border-radius:999px;background:rgba(7,11,20,.88);border:1px solid rgba(0,229,255,.45);color:#cfe9ff;font:13px/1.3 Figtree,Roboto,sans-serif;box-shadow:0 0 18px rgba(0,229,255,.25)";
+        const link = (href, text) => `<a href="${href}" target="_blank" rel="noopener" style="color:#00e5ff;font-weight:600;text-decoration:none">${text}</a>`;
+        // the install button stands out; GitHub, the manual and the language as plain links
+        const install = (text) =>
+          `<a href="https://github.com/Mastershort/neonplan3d#installation" target="_blank" rel="noopener" style="background:#00e5ff;color:#06101c;font-weight:700;text-decoration:none;padding:5px 12px;border-radius:999px">${text}</a>`;
+        const github = link("https://github.com/Mastershort/neonplan3d", "★ GitHub");
+        bar.innerHTML = de
+          ? `<span>${narrow ? "Demo" : "Demo mit erfundenen Daten – probier alles aus"}</span>${install(narrow ? "Installieren" : "Jetzt installieren")}${github}${narrow ? "" : link("https://mastershort.de/neonplan3d/anleitung/?lang=de", "Anleitung")}${link("?site&lang=en", narrow ? "EN" : "English")}`
+          : `<span>${narrow ? "Demo" : "Demo with invented data – try everything"}</span>${install(narrow ? "Install" : "Install now")}${github}${narrow ? "" : link("https://mastershort.de/en/neonplan3d/manual/?lang=en", "Manual")}${link("?site&lang=de", narrow ? "DE" : "Deutsch")}`;
+        const close = document.createElement("button");
+        close.textContent = "×";
+        close.setAttribute("aria-label", de ? "Schließen" : "Close");
+        close.style.cssText = "background:none;border:0;color:#cfe9ff;font-size:16px;cursor:pointer;padding:0 2px";
+        close.onclick = () => bar.remove();
+        bar.append(close);
+        document.body.append(bar);
+      }
+      if (params.has("card")) {
+        // ?card: the dashboard card next to its visual editor (like Home Assistant's card dialog)
+        document.querySelector("neoncasa3d-panel").remove();
+        const CardClass = customElements.get("neoncasa3d-card");
+        const wrap = document.createElement("div");
+        wrap.style.cssText = "display:grid;grid-template-columns:420px 1fr;gap:24px;padding:24px;font-family:Figtree,Roboto,sans-serif;--primary-text-color:#e1e1e1;--secondary-text-color:#9b9b9b;--card-background-color:#1c1c1c;--primary-color:#03a9f4;--divider-color:rgba(225,225,225,.2)";
+        const editorBox = document.createElement("div");
+        editorBox.style.cssText = "background:#1c1c1c;border-radius:12px;padding:20px";
+        const editor = await CardClass.getConfigElement();
+        const card = document.createElement("neoncasa3d-card");
+        let config = {
+          type: "custom:neoncasa3d-card",
+          quality: "low",
+          floor: params.get("floor") || "eg",
+          flows: false,
+          controls: ["walls", "temperature"],
+          fullscreen_button: true,
+          floor_thumbs: true,
+          ...(params.get("stack") ? { floor_stack: params.get("stack") } : {}),
+          ...(params.has("nopanel") ? { room_panel: false } : {}),
+          ...(params.has("night") ? { night: "00:00-23:59" } : {}),
+          ...(params.has("kiosk") ? { idle_return: 1, idle_orbit: true } : {}),
+        };
+        card.setConfig(config);
+        editor.setConfig(config);
+        editor.addEventListener("config-changed", (e) => {
+          config = e.detail.config;
+          card.setConfig(config);
+          editor.setConfig(config);
+        });
+        editor.hass = hass;
+        card.hass = hass;
+        editorBox.append(editor);
+        wrap.append(editorBox, card);
+        document.body.append(wrap);
+        window.nc3dCard = card;
+      } else {
+        const panel = document.querySelector("neoncasa3d-panel");
+        panel.hass = hass;
+        window.addEventListener("hass-more-info", (e) => console.log("more-info", e.detail.entityId));
+        panel.narrow = window.innerWidth < 870;
+        window.nc3dPanel = panel;
+      }
+    </script>
+  </body>
+</html>
