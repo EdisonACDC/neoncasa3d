@@ -9,8 +9,9 @@ import { closeGaps, suggestedThickness } from "../geometry/gaps.ts";
 import { keepInRoom, snapToWall } from "../geometry/snap.ts";
 import { holeInRoom } from "../geometry/holes.ts";
 import { weatherEntity } from "../weather.ts";
-import { SHOW_ENERGY, SHOW_PRESENCE } from "../flags.ts";
+import { SHOW_PRESENCE } from "../flags.ts";
 import { hasFeature, manualUrl, shopUrl } from "../features.ts";
+import { deviceSensors, flowSegments, gridPoint, proposeEnergySensors, type EnergyPrefs, type FlowSegment } from "../energy.ts";
 import { isStatusSensor, robotRoomSensor, TOGGLE_KINDS } from "../devices.ts";
 import { ridgeHeight, roofSectionsFromRooms, sectionFrame, sectionProfile, wallTopUnder } from "../roof-sections.ts";
 import { bestFace, clampField, faceAt, faceCompass, fieldFace, fieldModules, GROUND, pointOnFace, proposeField, proposeGroundField, proposeWindow, proposeWallField, roofFaces, rowCounts, turnGroundField, fieldCenter, wallFaces, windowAsField, windowCorners, onFace, onField, rayOnFace, type RoofFace } from "../solar.ts";
@@ -31,6 +32,9 @@ import {
   FLOOR_MATERIALS,
   FURNITURE_GROUPS,
   ENERGY_DEVICES,
+  DEFAULT_HOLOGRAM,
+  type HologramSettings,
+  type StartView,
   FURNITURE_SIZE,
   FURNITURE_TYPES,
   canLift,
@@ -92,7 +96,7 @@ import { furnitureSize, isElectric, mountBase, packItem, packItemName, packType,
 /** Items that can be fixed against moving. */
 type FixKind = "room" | "opening" | "furniture" | "device" | "wall" | "outdoor";
 
-type Tool = "select" | "rect" | "polygon" | "measure" | "opening" | "furniture" | "outdoor" | "hole" | "wall" | "meter" | "roof" | "energy";
+type Tool = "select" | "rect" | "polygon" | "measure" | "opening" | "furniture" | "outdoor" | "hole" | "wall" | "roof" | "energy";
 
 type Drag =
   | { kind: "pan"; last: [number, number] }
@@ -110,6 +114,7 @@ type Drag =
   | { kind: "solarmove"; id: string; start: Vec2; startScreen: [number, number]; base: Building; moved: boolean; grab: { du: number; ds: number } | null; win?: boolean }
   | { kind: "outvertex"; id: string; index: number; base: Building; moved: boolean }
   | { kind: "roofcorner"; id: string; corner: [0 | 1, 0 | 1]; base: Building; moved: boolean }
+  | { kind: "cablept"; id: string; index: number; base: Building; moved: boolean }
   | { kind: "freewall"; start: Vec2; end: Vec2 }
   | { kind: "wallmove"; id: string; end: "a" | "b" | null; start: Vec2; startScreen: [number, number]; base: Building; moved: boolean }
   | { kind: "outdoor"; id: string; start: Vec2; startScreen: [number, number]; base: Building; moved: boolean }
@@ -122,7 +127,7 @@ interface Guides {
 }
 
 /** Drags that change the document live (restored when cancelled, recorded in the history when done). */
-const EDIT_DRAGS = new Set(["vertex", "room", "device", "opening", "furniture", "rotate", "resize", "outdoor", "roofmove", "roofcorner", "outvertex", "solarmove", "solarturn"]);
+const EDIT_DRAGS = new Set(["vertex", "room", "device", "opening", "furniture", "rotate", "resize", "outdoor", "roofmove", "roofcorner", "outvertex", "solarmove", "solarturn", "cablept"]);
 
 const HISTORY = 100;
 const SNAP_PX = 10;
@@ -158,6 +163,8 @@ export class Fp3dEditor extends LitElement {
     _solarId: { state: true },
     _solarPick: { state: true },
     _roofWinId: { state: true },
+    _energyNote: { state: true },
+    _cableId: { state: true },
     _furnQuery: { state: true },
     _libOpen: { state: true },
     _expanded: { state: true },
@@ -224,6 +231,12 @@ export class Fp3dEditor extends LitElement {
   private declare _solarPick: boolean;
   /** Selected roof window (roof tool). */
   private declare _roofWinId: string | null;
+  /** What the import from the energy dashboard did (shown under its button). */
+  private declare _energyNote: string | null;
+  /** The cable picked in the energy tool (its key), shown with its points in the plan. */
+  private declare _cableId: string | null;
+  /** The cables' ways for the plan, computed once per document. */
+  private cableCache: { doc: Building; segs: FlowSegment[] } | null = null;
   /** Furniture library: the search text, and which sections are open (built-in groups and packs). */
   private declare _furnQuery: string;
   private declare _libOpen: Set<string>;
@@ -293,6 +306,8 @@ export class Fp3dEditor extends LitElement {
     this._solarId = null;
     this._solarPick = false;
     this._roofWinId = null;
+    this._energyNote = null;
+    this._cableId = null;
     this._furnQuery = "";
     this._libOpen = new Set(["group:lights", "group:living"]);
     try {
@@ -953,6 +968,69 @@ export class Fp3dEditor extends LitElement {
         this.drag = this.isAdmin ? { kind: "furniture", id: marker, start: world, startScreen: local, base: this._doc, moved: false } : { kind: "pan", last: local };
         return;
       }
+      if (this._tool === "energy") {
+        const pt = target.closest("[data-cable-pt]")?.getAttribute("data-cable-pt");
+        const lockedCable = (id: string) => !!this._doc.settings.roof.cables?.find((c) => c.id === id)?.locked;
+        if (pt && this.isAdmin && !lockedCable(pt.slice(0, pt.lastIndexOf(":")))) {
+          const i = pt.lastIndexOf(":");
+          const id = pt.slice(0, i);
+          const index = Number(pt.slice(i + 1));
+          // a double click takes the point out (two points stay at least)
+          if (e.detail >= 2) {
+            this.change((d) => {
+              const c = d.settings.roof.cables?.find((x) => x.id === id);
+              if (c && c.points.length > 1) c.points.splice(index, 1);
+            });
+            this.drag = { kind: "pan", last: local };
+            return;
+          }
+          this.drag = { kind: "cablept", id, index, base: this._doc, moved: false };
+          return;
+        }
+        const line = target.closest("[data-cable-line]")?.getAttribute("data-cable-line");
+        if (line && this.isAdmin && !lockedCable(line)) {
+          // a click on the laid cable puts a new point there and takes it along (piece i lies before point i)
+          const index = Number(target.closest("[data-cable-line]")?.getAttribute("data-cable-seg") ?? 0);
+          const base = this._doc;
+          this.change((d) => {
+            const c = d.settings.roof.cables?.find((x) => x.id === line);
+            if (c) c.points.splice(index, 0, [round(world[0]), round(world[1])]);
+          });
+          this.drag = { kind: "cablept", id: line, index, base, moved: true };
+          return;
+        }
+        const cable = target.closest("[data-cable]")?.getAttribute("data-cable");
+        if (cable) {
+          this._cableId = cable;
+          // grabbing an automatic cable lays it by hand right away, with a new point under the pointer to drag
+          if (this.isAdmin && this._floorId && !this._doc.settings.roof.cables?.some((c) => c.id === cable)) {
+            const base = this._doc;
+            this.layCable(cable);
+            const laid = this._doc.settings.roof.cables?.find((c) => c.id === cable);
+            const mine = this.cableSegments().filter((x) => x.key === cable);
+            if (laid && mine.length) {
+              const chain: Vec2[] = [[mine[0].a[0], mine[0].a[2]], ...laid.points, [mine[mine.length - 1].b[0], mine[mine.length - 1].b[2]]];
+              let index = 0;
+              let best = Infinity;
+              for (let i = 0; i + 1 < chain.length; i++) {
+                const d = distToSegment(world, chain[i], chain[i + 1]);
+                if (d < best) {
+                  best = d;
+                  index = i;
+                }
+              }
+              this.change((d) => {
+                const c = d.settings.roof.cables?.find((x) => x.id === cable);
+                if (c) c.points.splice(index, 0, [round(world[0]), round(world[1])]);
+              });
+              this.drag = { kind: "cablept", id: cable, index, base, moved: true };
+              return;
+            }
+          }
+          this.drag = { kind: "pan", last: local };
+          return;
+        }
+      }
       const solar = this._tool === "energy" ? target.closest("[data-solar]")?.getAttribute("data-solar") : null;
       const turn = this._tool === "energy" ? target.closest("[data-solar-turn]")?.getAttribute("data-solar-turn") : null;
       if (turn && this.isAdmin) {
@@ -1032,15 +1110,6 @@ export class Fp3dEditor extends LitElement {
     }
     if (this._tool === "opening") {
       if (!this.placeOpening(this._openingPreset, local)) this.drag = { kind: "pan", last: local };
-      return;
-    }
-    if (this._tool === "meter") {
-      if (this.isAdmin && this._floorId) {
-        const g = this._doc.settings.grid;
-        const [x, z] = world.map((v) => round(Math.round(v / g) * g));
-        this.setEnergy({ meter: { floor_id: this._floorId, x, z } });
-      }
-      this._tool = "select";
       return;
     }
     const deviceEl = target.closest("[data-device]");
@@ -1373,6 +1442,19 @@ export class Fp3dEditor extends LitElement {
         );
         break;
       }
+      case "cablept": {
+        drag.moved = true;
+        const p = this.snap(world, undefined, e.altKey);
+        this.change(
+          (doc) => {
+            const c = doc.settings.roof.cables?.find((x) => x.id === drag.id);
+            if (c && c.points[drag.index]) c.points[drag.index] = [round(p[0]), round(p[1])];
+          },
+          drag.base,
+          false,
+        );
+        break;
+      }
       case "roofcorner": {
         drag.moved = true;
         const p = this.snap(world, undefined, e.altKey);
@@ -1533,6 +1615,7 @@ export class Fp3dEditor extends LitElement {
       case "solarturn":
       case "roofmove":
       case "roofcorner":
+      case "cablept":
         if (drag.moved) this.pushHistory(drag.base);
         break;
       case "device":
@@ -2332,10 +2415,159 @@ export class Fp3dEditor extends LitElement {
   }
 
   /** Energy tool: a round marker with a symbol and its name on every energy device of the floor, above all else. */
+  /** The cables' ways (with a still picture of the flows: all sensors at zero), once per document. */
+  private cableSegments(): FlowSegment[] {
+    if (this.cableCache?.doc === this._doc) return this.cableCache.segs;
+    const b = this._doc;
+    const fieldPower = new Map((b.settings.roof.solar ?? []).map((f) => [f.id, 0]));
+    const summary = { grid: 0, solar: 0, battery: 0, soc: null, tariff: null, consumption: 0 };
+    let segs: FlowSegment[] = [];
+    try {
+      segs = flowSegments({ building: b, consumers: [], summary, fieldPower }).filter((x) => x.key);
+    } catch {
+      segs = [];
+    }
+    this.cableCache = { doc: b, segs };
+    return segs;
+  }
+
+  /** The cables by key, in order: solar fields, inverters, batteries, the grid. */
+  private cableKeys(): string[] {
+    const keys = [...new Set(this.cableSegments().map((x) => x.key!))];
+    const rank = (k: string) => (k.startsWith("solar:") ? 0 : k.startsWith("inv:") ? 1 : k.startsWith("bat:") ? 2 : 3);
+    return keys.sort((p, q) => rank(p) - rank(q) || p.localeCompare(q));
+  }
+
+  /** What a cable key means to the user: "Solarfeld 1 → Wechselrichter Nord". */
+  private cableLabel(key: string): string {
+    const furn = (id: string) => {
+      const m = this._doc.floors.flatMap((f) => f.furniture).find((x) => x.id === id);
+      return m ? m.name || this.t(`furn_${m.type}` as I18nKey) : "?";
+    };
+    const meter = this._doc.floors.flatMap((f) => f.furniture).find((x) => x.type === "meter");
+    const meterName = meter ? meter.name || this.t("furn_meter") : this.t("energy_meter");
+    if (key === "grid") return `${meterName} → ${this.t("furn_grid_point")}`;
+    const [kind, id] = [key.slice(0, key.indexOf(":")), key.slice(key.indexOf(":") + 1)];
+    if (kind === "solar") {
+      const fields = this._doc.settings.roof.solar ?? [];
+      const i = fields.findIndex((f) => f.id === id);
+      const f = fields[i];
+      return `${f?.name || `${this.t("solar_field")} ${i + 1}`} → ${this.t("furn_inverter")}`;
+    }
+    if (kind === "inv") return `${furn(id)} → ${meterName}`;
+    return `${this.t("furn_inverter")} ↔ ${furn(id)}`;
+  }
+
+  /** Lay a cable by hand: its automatic way (on the plan) becomes points to drag. */
+  private layCable(key: string): void {
+    if (!this.isAdmin || !this._floorId) return;
+    const pts: Vec2[] = [];
+    for (const seg of this.cableSegments().filter((x) => x.key === key)) {
+      for (const q of [seg.a, seg.b]) {
+        const p: Vec2 = [round(q[0]), round(q[2])];
+        const last = pts[pts.length - 1];
+        if (!last || Math.hypot(last[0] - p[0], last[1] - p[1]) > 0.05) pts.push(p);
+      }
+    }
+    // the ends are the devices themselves: only the way between them is laid
+    const inner = pts.length > 2 ? pts.slice(1, -1) : pts;
+    const floorId = this._floorId;
+    this.change((d) => {
+      d.settings.roof.cables = [...(d.settings.roof.cables ?? []).filter((c) => c.id !== key), { id: key, floor_id: floorId, points: inner.length ? inner : [pts[0] ?? [0, 0]], height: 0.03 }];
+    });
+    this._cableId = key;
+  }
+
+  /** The cables in the plan: faint for the automatic ways, solid for laid ones, with points on the picked cable. */
+  private renderCables() {
+    if (!hasFeature("energy_pro")) return nothing;
+    const all = this.cableSegments();
+    if (!all.length) return nothing;
+    const segs = all.filter((x) => x.floorId === this._floorId);
+    const cables = this._doc.settings.roof.cables ?? [];
+    const sel = this._cableId;
+    const keys = [...new Set(all.map((x) => x.key!))];
+    return svg`<g class="nc3d-cable-layer">${keys.map((key) => {
+      const laid = cables.find((c) => c.id === key);
+      const cls = `nc3d-cable nc3d-cable-${key.split(":")[0]}${laid ? " nc3d-cable-laid" : ""}${key === sel ? " nc3d-cable-sel" : ""}`;
+      const mine = all.filter((x) => x.key === key);
+      const lines = segs
+        .filter((x) => x.key === key)
+        .map((x) => {
+          const a = this.toScreen([x.a[0], x.a[2]]);
+          const b = this.toScreen([x.b[0], x.b[2]]);
+          return svg`<line x1=${a[0]} y1=${a[1]} x2=${b[0]} y2=${b[1]} />`;
+        });
+      if (!(laid && key === sel && laid.floor_id === this._floorId && !laid.locked)) return lines.length ? svg`<g class=${cls} data-cable=${key}><g class="nc3d-cable-hit">${lines}</g>${lines}</g>` : nothing;
+      // the picked laid cable: its points to drag; every piece from device to device takes new points
+      const first = mine[0];
+      const last = mine[mine.length - 1];
+      const chain = [this.toScreen([first.a[0], first.a[2]]), ...laid.points.map((p) => this.toScreen(p)), this.toScreen([last.b[0], last.b[2]])];
+      const pieces = chain.slice(0, -1).map((p, i) => svg`<line class="nc3d-cable-piece" data-cable-line=${key} data-cable-seg=${i} x1=${p[0]} y1=${p[1]} x2=${chain[i + 1][0]} y2=${chain[i + 1][1]} />`);
+      const handles = laid.points.map((p, i) => {
+        const q = this.toScreen(p);
+        return svg`<g class="nc3d-vertex" data-cable-pt=${`${key}:${i}`}><circle cx=${q[0]} cy=${q[1]} r="16" class="nc3d-hit" /><circle cx=${q[0]} cy=${q[1]} r="6" /></g>`;
+      });
+      return svg`<g class=${cls} data-cable=${key}>${lines}${pieces}${handles}</g>`;
+    })}</g>`;
+  }
+
+  /** Energie Pro: the cables, each to lay by hand with points and a height. */
+  private renderCableSettings() {
+    const keys = this.cableKeys();
+    if (!keys.length) return nothing;
+    const admin = this.isAdmin;
+    const cables = this._doc.settings.roof.cables ?? [];
+    const sel = this._cableId ? cables.find((c) => c.id === this._cableId) : undefined;
+    return html`<section>
+      <h3>〰 ${this.t("cables_title")}</h3>
+      <p class="nc3d-sub">${this.t("cables_hint")}</p>
+      <div class="nc3d-room-list">
+        ${keys.map(
+          (key) => html`<div class="nc3d-row">
+            <button
+              class="nc3d-dev-name ${key === this._cableId ? "nc3d-sel" : ""}"
+              @click=${() => {
+                this._cableId = key === this._cableId ? null : key;
+                // a laid cable lives on its floor: the plan goes there so its points can be dragged
+                const laid = cables.find((c) => c.id === key);
+                if (this._cableId && laid && this._doc.floors.some((f) => f.id === laid.floor_id)) this._floorId = laid.floor_id;
+              }}
+            >
+              <span>${this.cableLabel(key)}${cables.some((c) => c.id === key) ? html` <em class="nc3d-sub">· ${this.t("cable_laid")}</em>` : nothing}</span>
+            </button>
+          </div>`,
+        )}
+      </div>
+      ${this._cableId
+        ? html`<div class="nc3d-actions">
+              ${sel
+                ? html`<button class="nc3d-btn nc3d-fix" aria-pressed=${!!sel.locked} title=${this.t("fix_hint")} ?disabled=${!admin} @click=${() => this.change((d) => {
+                      const c = d.settings.roof.cables?.find((x) => x.id === sel.id);
+                      if (c) c.locked = !c.locked;
+                    })}>
+                      ${sel.locked ? `🔒 ${this.t("unfix")}` : `🔓 ${this.t("fix")}`}
+                    </button>
+                    <button class="nc3d-btn" ?disabled=${!admin} @click=${() => this.change((d) => (d.settings.roof.cables = (d.settings.roof.cables ?? []).filter((c) => c.id !== this._cableId)))}>${this.t("cable_auto")}</button>`
+                : html`<button class="nc3d-btn nc3d-primary" ?disabled=${!admin || !this._floorId} @click=${() => this.layCable(this._cableId!)}>${this.t("cable_lay")}</button>`}
+            </div>
+            ${sel
+              ? html`<div class="nc3d-form">
+                    ${this.num(this.t("cable_height"), sel.height, (v) => this.change((d) => {
+                      const c = d.settings.roof.cables?.find((x) => x.id === sel.id);
+                      if (c) c.height = Math.min(30, Math.max(0, round(v)));
+                    }), 0.05, 0)}
+                  </div>
+                  <p class="nc3d-sub">${sel.floor_id === this._floorId ? this.t("cable_points_hint") : this.t("cable_other_floor", { floor: this._doc.floors.find((f) => f.id === sel.floor_id)?.name ?? "" })}</p>`
+              : nothing}`
+        : nothing}
+    </section>`;
+  }
+
   private renderEnergyMarkers() {
     const floor = this.floor;
     if (!floor) return nothing;
-    const icons: Record<string, string> = { inverter: "⚡", home_battery: "🔋", wallbox: "🔌" };
+    const icons: Record<string, string> = { inverter: "⚡", home_battery: "🔋", wallbox: "🔌", meter: "📟", grid_point: "🏁" };
     return svg`<g class="nc3d-energy-markers">${floor.furniture
       .filter((m) => (ENERGY_DEVICES as readonly string[]).includes(m.type))
       .map((m) => {
@@ -2726,7 +2958,34 @@ export class Fp3dEditor extends LitElement {
     if (device)
       return html`<button class="nc3d-btn nc3d-back" @click=${() => this.selectItem("furniture", null)}>‹ ${this.t("tool_energy")}</button>
         ${this.renderFurnitureForm(device)}`;
-    return html`${this.renderSolarList()}${this.renderEnergyDevices()}${this.renderSolarProTeaser()}`;
+    const pro = hasFeature("energy_pro");
+    return html`${this.renderSolarList()}${this.renderEnergyDevices()}${this.renderEnergyBalance()}${pro ? this.renderCableSettings() : nothing}${pro ? this.renderHologramSettings() : nothing}${this.renderSolarProTeaser()}`;
+  }
+
+  /** Energie Pro: which solar field the hologram hangs on, how big it is and where exactly. */
+  private renderHologramSettings() {
+    const fields = this._doc.settings.roof.solar ?? [];
+    if (!fields.length) return nothing;
+    const admin = this.isAdmin;
+    const h = this._doc.settings.roof.hologram ?? DEFAULT_HOLOGRAM;
+    const set = (patch: Partial<HologramSettings>) => this.change((d) => (d.settings.roof.hologram = { ...(d.settings.roof.hologram ?? DEFAULT_HOLOGRAM), ...patch }));
+    const name = (f: SolarField, i: number) => f.name || `${this.t("solar_field")} ${i + 1}`;
+    return html`<section>
+      <h3>◈ ${this.t("holo_settings")}</h3>
+      <p class="nc3d-sub">${this.t("holo_settings_hint")}</p>
+      <div class="nc3d-form">
+        <label class="nc3d-field nc3d-wide"
+          >${this.t("holo_field")}
+          <select ?disabled=${!admin} @change=${(e: Event) => set({ field: (e.target as HTMLSelectElement).value || null })}>
+            <option value="" ?selected=${!h.field}>${this.t("holo_field_auto")}</option>
+            ${fields.map((f, i) => html`<option value=${f.id} ?selected=${f.id === h.field}>${name(f, i)}</option>`)}
+          </select>
+        </label>
+        ${this.num(this.t("holo_size"), h.size, (v) => set({ size: Math.min(3, Math.max(0.3, round(v))) }), 0.1, 0.3)}
+        ${this.num(this.t("holo_right"), h.right, (v) => set({ right: Math.min(30, Math.max(-30, round(v))) }), 0.25)}
+        ${this.num(this.t("holo_up"), h.up, (v) => set({ up: Math.min(30, Math.max(-30, round(v))) }), 0.25)}
+      </div>
+    </section>`;
   }
 
   /** The coming Pro add-on: a picture and what it will do. */
@@ -2752,13 +3011,25 @@ export class Fp3dEditor extends LitElement {
   private addEnergyDevice(type: string): void {
     const floor = this.floor;
     if (!floor || !this.isAdmin) return;
+    if (type === "grid_point") {
+      // the grid connection goes where the cable would reach the street by itself; then it can be dragged
+      const auto = gridPoint(this._doc);
+      const [gw, gd, gh] = furnitureSize(type);
+      const [gx, gz] = auto ? auto.end : this.toWorld(this._size.w / 2, this._size.h / 2);
+      const point: Furniture = { id: uid("furniture"), type, x: round(gx), z: round(gz), rotation: 0, w: gw, d: gd, h: gh, variant: null };
+      this.change((_, f) => f.furniture.push(point));
+      this.selectItem("furniture", point.id);
+      this.showPoint(point.x, point.z);
+      return;
+    }
     const areaName = (r: Room) => `${r.name} ${(r.area_id && this.hass?.areas?.[r.area_id]?.name) || ""} ${r.area_id ?? ""}`.toLowerCase();
     const rooms = floor.rooms.filter((r) => r.points.length >= 3);
     const find = (re: RegExp) => rooms.find((r) => re.test(areaName(r)));
     const parked = rooms.find((r) => floor.furniture.some((m) => m.type === "parking" && pointInPolygon([m.x, m.z], r.points)));
     const garage = find(/garage|carport/) ?? parked;
     const utility = find(/hwr|hauswirt|technik|keller|abstell|utility|basement|boiler|heiz/);
-    const room = (type === "wallbox" ? garage : (utility ?? garage)) ?? this.room ?? rooms.sort((a, b) => Math.abs(signedArea(b.points)) - Math.abs(signedArea(a.points)))[0];
+    const hall = find(/flur|diele|eingang|hall|entr|lobby/);
+    const room = (type === "wallbox" ? garage : type === "meter" ? (utility ?? hall ?? garage) : (utility ?? garage)) ?? this.room ?? rooms.sort((a, b) => Math.abs(signedArea(b.points)) - Math.abs(signedArea(a.points)))[0];
     const [w, d, h] = furnitureSize(type);
     let [x, z] = room ? centroid(room.points) : this.toWorld(this._size.w / 2, this._size.h / 2);
     if (room) {
@@ -2812,7 +3083,7 @@ export class Fp3dEditor extends LitElement {
                     this.showPoint(m.x, m.z);
                   }}
                 >
-                  <span>${this.t(`furn_${m.type}` as I18nKey)} · ${fl.name}</span>
+                  <span>${m.name || this.t(`furn_${m.type}` as I18nKey)} · ${fl.name}</span>
                 </button>
               </div>`,
             )}
@@ -3456,7 +3727,7 @@ export class Fp3dEditor extends LitElement {
               ${floor && this._tool === "select" ? this.renderDevices(floor) : nothing}
               ${this.room && this.isAdmin && this._tool === "select" && !this._openingId && !this._furnitureId && !this.isFixedItem("room", this.room.id) ? this.renderHandles(this.room) : nothing}
               ${floor ? this.renderOutdoorHandles(floor) : nothing}
-              ${this._tool === "roof" ? svg`${this.renderRoofSections()}${this.renderRoofWindows()}` : this._tool === "energy" ? svg`${this.renderRoofSections()}${this.renderSolarFields()}${this.renderEnergyMarkers()}` : nothing} ${this.renderDraft()} ${this.renderGuides()}
+              ${this._tool === "roof" ? svg`${this.renderRoofSections()}${this.renderRoofWindows()}` : this._tool === "energy" ? svg`${this.renderRoofSections()}${this.renderSolarFields()}${this.renderCables()}${this.renderEnergyMarkers()}` : nothing} ${this.renderDraft()} ${this.renderGuides()}
             </svg>
             ${this.renderContext()}
             <p class="nc3d-hint ${this._fixedHint ? "nc3d-hint-fixed" : ""}">${!floor ? this.t("hint_empty") : this._fixedHint ? this.t("fixed_drag_hint") : this.t(`hint_${this._tool}` as I18nKey)}</p>
@@ -3564,9 +3835,14 @@ export class Fp3dEditor extends LitElement {
           @focusout=${off}
         >
           <span><b>${this.t("wall_n", { a: i + 1, b: ((i + 1) % n) + 1 })}</b><br /><span class="nc3d-muted">${formatNumber(this.hass, len, 2)} m</span></span>
-          ${this.num(this.t("wall_height"), h ?? H, (v) => this.setEdgeHeight(room, i, v >= H - 0.005 ? null : Math.max(0.05, v)), 0.05, 0.05)}
+          ${h === 0
+            ? html`<span class="nc3d-muted">${this.t("wall_none")}</span>`
+            : this.num(this.t("wall_height"), h ?? H, (v) => this.setEdgeHeight(room, i, v >= H - 0.005 ? null : Math.max(0.05, v)), 0.05, 0.05)}
           ${this.isAdmin && h !== null
             ? html`<button class="nc3d-btn" title=${this.t("wall_height_full")} @click=${() => this.setEdgeHeight(room, i, null)}>↥</button>`
+            : nothing}
+          ${this.isAdmin && h !== 0
+            ? html`<button class="nc3d-btn" title=${this.t("wall_none_hint")} @click=${() => this.setEdgeHeight(room, i, 0)}>${this.t("wall_none")}</button>`
             : nothing}
         </div>`;
       })}
@@ -4146,7 +4422,7 @@ export class Fp3dEditor extends LitElement {
             : floor
               ? this.renderRoomList(floor)
               : nothing}
-      ${admin && SHOW_ENERGY ? this.renderEnergySettings() : nothing}
+      ${admin ? this.renderStartView() : nothing}
       ${admin && SHOW_PRESENCE ? this.renderPresenceSettings() : nothing}
       ${floor && admin ? this.renderBackgroundForm(floor) : nothing} ${admin ? this.renderSettings() : nothing}
       ${admin ? this.renderBackup() : nothing}
@@ -4508,8 +4784,12 @@ export class Fp3dEditor extends LitElement {
   private renderFurnitureForm(f: Furniture) {
     const admin = this.isAdmin;
     return html`<section>
-      <div class="nc3d-h3row"><h3>${this.t("furniture")}</h3>${this.fixButton("furniture", f.id)}</div>
+      <div class="nc3d-h3row"><h3>${f.name || this.t("furniture")}</h3>${this.fixButton("furniture", f.id)}</div>
       <div class="nc3d-form">
+        <label class="nc3d-field nc3d-wide"
+          >${this.t("furn_name")}
+          <input type="text" maxlength="60" .value=${f.name ?? ""} ?disabled=${!admin} placeholder=${this.t(`furn_${f.type}` as I18nKey) === `furn_${f.type}` ? "" : this.t(`furn_${f.type}` as I18nKey)} @change=${(e: Event) => this.updateFurniture({ name: (e.target as HTMLInputElement).value.trim() || null })} />
+        </label>
         <label class="nc3d-field nc3d-wide"
           >${this.t("furniture_type")}
           <select ?disabled=${!admin} @change=${(e: Event) => this.updateFurniture({ type: (e.target as HTMLSelectElement).value })}>
@@ -4544,6 +4824,18 @@ export class Fp3dEditor extends LitElement {
               ? html`<p class="nc3d-sub nc3d-pack-error">${this.t("stairwell_outside")}</p>`
               : nothing}`
         : nothing}
+      ${f.type === "inverter" || f.type === "home_battery"
+        ? html`<div class="nc3d-form">
+            <label class="nc3d-field nc3d-wide"
+              >${this.t("furn_model")}
+              <select ?disabled=${!admin} @change=${(e: Event) => this.updateFurniture({ variant: (e.target as HTMLSelectElement).value || null })}>
+                ${(f.type === "inverter" ? (["", "slim", "hybrid"] as const) : (["", "wall", "cube"] as const)).map(
+                  (v) => html`<option value=${v} ?selected=${(f.variant ?? "") === v}>${this.t(`${f.type === "inverter" ? "inverter" : "battery"}_${v || "std"}` as I18nKey)}</option>`,
+                )}
+              </select></label
+            >
+          </div>`
+        : nothing}
       ${f.type === "lamp_pendant"
         ? html`<div class="nc3d-form">
             <label class="nc3d-field nc3d-wide"
@@ -4574,43 +4866,81 @@ export class Fp3dEditor extends LitElement {
     this.setDoc(next);
   }
 
-  private renderEnergySettings() {
+  /** Fill the balance from Home Assistant's energy dashboard: its statistics lead to power sensors of the same devices. */
+  private async importEnergyPrefs(): Promise<void> {
+    if (!this.hass) return;
+    let prefs: EnergyPrefs;
+    try {
+      prefs = await this.hass.callWS<EnergyPrefs>({ type: "energy/get_prefs" });
+    } catch {
+      this._energyNote = this.t("energy_import_failed");
+      return;
+    }
+    const found = proposeEnergySensors(this.hass, prefs);
+    // only empty fields are filled: what the user chose stays
     const e = this._doc.energy;
+    const patch = Object.fromEntries(Object.entries(found).filter(([k]) => e[k as keyof typeof e] == null));
+    const n = Object.keys(patch).length;
+    if (n) this.setEnergy(patch);
+    this._energyNote = n ? this.t("energy_import_done", { n }) : this.t("energy_import_none");
+  }
+
+  /** Grid, solar, battery and house sensors: from the devices in the plan unless chosen here. */
+  private renderEnergyBalance() {
+    const e = this._doc.energy;
+    const admin = this.isAdmin;
     const attr = (id: string, key: string) => this.hass?.states[id]?.attributes[key] as string | undefined;
     const power = this.entityOptions((id) => id.startsWith("sensor.") && attr(id, "device_class") === "power");
     const soc = this.entityOptions((id) => id.startsWith("sensor.") && attr(id, "device_class") === "battery");
     const tariff = this.entityOptions(
       (id) => id.startsWith("sensor.") && (attr(id, "device_class") === "monetary" || /\/(kWh|MWh)$/.test(attr(id, "unit_of_measurement") ?? "")),
     );
-    const pick = (key: "grid" | "solar" | "battery" | "battery_soc" | "tariff") => (v: string | null) => this.setEnergy({ [key]: v === "none" ? null : v });
-    const floorName = e.meter ? this._doc.floors.find((f) => f.id === e.meter!.floor_id)?.name : null;
-    return html`<details class="nc3d-section">
-      <summary>${this.t("energy")}</summary>
+    const pick = (key: "grid" | "solar" | "battery" | "battery_soc" | "consumption" | "tariff") => (v: string | null) => this.setEnergy({ [key]: v === "none" ? null : v });
+    const devices = deviceSensors(this._doc);
+    return html`<section>
+      <h3>⚖ ${this.t("energy_balance")}</h3>
+      <p class="nc3d-sub">${this.t("energy_balance_hint")}</p>
       <div class="nc3d-form">
-        <div class="nc3d-actions nc3d-wide">
-          <button class="nc3d-btn ${this._tool === "meter" ? "nc3d-primary" : ""}" ?disabled=${!this.floor} @click=${() => (this._tool = "meter")}>
-            ${this.t("energy_meter_set")}
-          </button>
-          ${e.meter ? html`<button class="nc3d-btn nc3d-danger" @click=${() => this.setEnergy({ meter: null })}>${this.t("energy_meter_remove")}</button>` : nothing}
-        </div>
-        <p class="nc3d-sub nc3d-wide">
-          ${e.meter ? `${this.t("energy_meter")}: ${floorName ?? ""} · ${formatNumber(this.hass, e.meter.x, 2)} / ${formatNumber(this.hass, e.meter.z, 2)} m` : this.t("energy_meter_hint")}
-        </p>
-        ${this.entitySelect(this.t("energy_grid"), e.grid, undefined, power, pick("grid"))}
+        ${this.entitySelect(this.t("energy_grid"), e.grid, devices.grid, power, pick("grid"))}
         <label class="nc3d-check nc3d-wide"
-          ><input type="checkbox" .checked=${e.grid_invert} @change=${(ev: Event) => this.setEnergy({ grid_invert: (ev.target as HTMLInputElement).checked })} />
+          ><input type="checkbox" .checked=${e.grid_invert} ?disabled=${!admin} @change=${(ev: Event) => this.setEnergy({ grid_invert: (ev.target as HTMLInputElement).checked })} />
           ${this.t("energy_invert")}</label
         >
-        ${this.entitySelect(this.t("energy_solar_sensor"), e.solar, undefined, power, pick("solar"))}
-        ${this.entitySelect(this.t("energy_battery_sensor"), e.battery, undefined, power, pick("battery"))}
+        ${this.entitySelect(this.t("energy_solar_sensor"), e.solar, devices.solar[0] ?? null, power, pick("solar"))}
+        ${this.entitySelect(this.t("energy_battery_sensor"), e.battery, devices.battery[0] ?? null, power, pick("battery"))}
         <label class="nc3d-check nc3d-wide"
-          ><input type="checkbox" .checked=${e.battery_invert} @change=${(ev: Event) => this.setEnergy({ battery_invert: (ev.target as HTMLInputElement).checked })} />
+          ><input type="checkbox" .checked=${e.battery_invert} ?disabled=${!admin} @change=${(ev: Event) => this.setEnergy({ battery_invert: (ev.target as HTMLInputElement).checked })} />
           ${this.t("energy_invert")}</label
         >
-        ${this.entitySelect(this.t("energy_battery_soc"), e.battery_soc, undefined, soc, pick("battery_soc"))}
+        ${this.entitySelect(this.t("energy_battery_soc"), e.battery_soc, devices.soc[0] ?? null, soc, pick("battery_soc"))}
+        ${this.entitySelect(this.t("energy_consumption_sensor"), e.consumption, null, power, pick("consumption"))}
         ${this.entitySelect(this.t("energy_tariff_sensor"), e.tariff, undefined, tariff, pick("tariff"))}
       </div>
+      <div class="nc3d-actions">
+        <button class="nc3d-btn" ?disabled=${!admin || !this.hass} @click=${() => this.importEnergyPrefs()}>${this.t("energy_import_prefs")}</button>
+      </div>
+      ${this._energyNote ? html`<p class="nc3d-sub">${this._energyNote}</p>` : nothing}
       <p class="nc3d-sub">${this.t("energy_hint")}</p>
+    </section>`;
+  }
+
+  /** The camera the house opens with: the editor's 3D pane as it stands right now, or the default. */
+  private renderStartView() {
+    const set = this._doc.settings.start_view ?? null;
+    const remember = () => {
+      const pane = this.renderRoot.querySelector("nc3d-view3d") as (HTMLElement & { currentView(): StartView | null }) | null;
+      const v = pane?.currentView();
+      if (!v) return;
+      this.change((d) => (d.settings.start_view = { theta: round(v.theta), phi: round(v.phi), radius: round(v.radius) }));
+    };
+    return html`<details class="nc3d-section">
+      <summary>${this.t("start_view")}</summary>
+      <p class="nc3d-sub">${this.t("start_view_hint")}</p>
+      <div class="nc3d-actions">
+        <button class="nc3d-btn nc3d-primary" @click=${remember}>${this.t("start_view_set")}</button>
+        ${set ? html`<button class="nc3d-btn" @click=${() => this.change((d) => (d.settings.start_view = null))}>${this.t("start_view_reset")}</button>` : nothing}
+      </div>
+      ${set ? html`<p class="nc3d-sub">${this.t("start_view_saved")}</p>` : nothing}
     </details>`;
   }
 
@@ -4678,10 +5008,20 @@ export class Fp3dEditor extends LitElement {
     const power = this.entityOptions((id) => id.startsWith("sensor.") && hass.states[id]?.attributes.device_class === "power");
     const doorSensors = f.type === "fridge_smart" ? this.entityOptions((id) => id.startsWith("binary_sensor.")) : [];
     return html`<div class="nc3d-form nc3d-links">
-        ${this.entitySelect(this.t(lamp ? "furn_entity_light" : media ? "furn_entity_tv" : f.type === "radiator" ? "furn_entity_climate" : f.type === "robot_vacuum" ? "furn_entity_vacuum" : "furn_entity"), f.entity ?? null, autoPick("entity"), entities, (v) =>
-          this.updateFurniture({ entity: v }),
-        )}
-        ${lamp ? nothing : this.entitySelect(this.t("furn_power"), f.power ?? null, autoPick("power"), power, (v) => this.updateFurniture({ power: v }))}
+        ${f.type === "grid_point"
+          ? html`<p class="nc3d-sub nc3d-wide">${this.t("grid_point_hint")}</p>`
+          : this.entitySelect(this.t(lamp ? "furn_entity_light" : media ? "furn_entity_tv" : f.type === "radiator" ? "furn_entity_climate" : f.type === "robot_vacuum" ? "furn_entity_vacuum" : "furn_entity"), f.entity ?? null, autoPick("entity"), entities, (v) =>
+              this.updateFurniture({ entity: v }),
+            )}
+        ${lamp || f.type === "grid_point"
+          ? nothing
+          : this.entitySelect(
+              this.t(f.type === "meter" ? "energy_grid" : f.type === "inverter" ? "energy_solar_sensor" : f.type === "home_battery" ? "energy_battery_sensor" : "furn_power"),
+              f.power ?? null,
+              autoPick("power"),
+              power,
+              (v) => this.updateFurniture({ power: v }),
+            )}
       </div>
       ${f.type === "home_battery"
         ? html`<div class="nc3d-form nc3d-links">
@@ -6226,6 +6566,44 @@ export class Fp3dEditor extends LitElement {
       .nc3d-tool-energy .nc3d-energy-item {
         pointer-events: auto;
       }
+      /* the cables in the energy tool: faint automatic ways, solid laid ones */
+      .nc3d-cable line {
+        stroke: #ffd75a;
+        stroke-width: 2;
+        stroke-dasharray: 5 4;
+        opacity: 0.8;
+        pointer-events: none;
+      }
+      .nc3d-cable-bat line {
+        stroke: #5dffb0;
+      }
+      .nc3d-cable-grid line {
+        stroke: #4ff6ff;
+      }
+      .nc3d-cable-hit line {
+        stroke-width: 12;
+        opacity: 0;
+        pointer-events: stroke;
+        cursor: pointer;
+      }
+      .nc3d-cable-laid line {
+        stroke-dasharray: none;
+        opacity: 0.9;
+      }
+      .nc3d-cable-sel line {
+        stroke-width: 2.5;
+        opacity: 1;
+        filter: drop-shadow(0 0 4px currentColor);
+      }
+      .nc3d-cable-sel .nc3d-cable-piece {
+        stroke-width: 14;
+        opacity: 0;
+        pointer-events: stroke;
+        cursor: copy;
+      }
+      .nc3d-cable .nc3d-vertex circle {
+        pointer-events: auto;
+      }
       .nc3d-energy-marker {
         cursor: move;
       }
@@ -6847,3 +7225,12 @@ if (!customElements.get("nc3d-editor")) customElements.define("nc3d-editor", Fp3
 
 // the extensions page is part of this bundle: the panel loads it the same way as the editor
 import "./extensions.ts";
+
+/** Distance of a plan point from a segment. */
+function distToSegment(p: Vec2, a: Vec2, b: Vec2): number {
+  const dx = b[0] - a[0];
+  const dz = b[1] - a[1];
+  const l2 = dx * dx + dz * dz || 1;
+  const t = Math.min(1, Math.max(0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dz) / l2));
+  return Math.hypot(p[0] - a[0] - dx * t, p[1] - a[1] - dz * t);
+}

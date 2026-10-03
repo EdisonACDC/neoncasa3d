@@ -1,6 +1,6 @@
 // Lit wrapper around the lazily loaded 3D viewer.
 
-import { css, html, LitElement, nothing, type PropertyValues } from "lit";
+import { css, html, LitElement, nothing, svg, type PropertyValues } from "lit";
 import {
   appColor,
   areaEntities,
@@ -23,7 +23,12 @@ import {
 } from "../devices.ts";
 import { alertColor, alertEntities, alertSources, alertText, findAlerts, type Alert, type AlertSources } from "../alerts.ts";
 import { iconPath, iconSvg } from "../icons.ts";
-import { energySummary, findConsumers, flowColor, flowSegments, powerSensorFor, readPower, type Consumer, type EnergySummary } from "../energy.ts";
+import { deviceSensors, energySummary, fetchSolarDay, fieldLevels, fieldPowers, findConsumers, flowColor, flowSegments, gridPoint, powerSensorFor, readPower, solarCurvePath, type Consumer, type EnergySummary, type SolarDay } from "../energy.ts";
+import { fieldFace, fieldSize } from "../solar.ts";
+import { DEFAULT_HOLOGRAM } from "../model.ts";
+
+/** The pin at the street end of the grid cable. */
+const GRID_ICON = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>';
 import { STAGE, type Theme } from "../themes.ts";
 import { HEAT_SCALES, heatColor, heatGradient, roomValues, type HeatMode } from "../heatmap.ts";
 import { furnitureName } from "../furniture-names.ts";
@@ -33,7 +38,7 @@ import { getPacks, mountBase, packItem, packsVersion } from "../packs.ts";
 import { parkedVehicles, parkingEntities } from "../parking.ts";
 import { TRAIL_ICON, TRAIL_WINDOW_MS, trailEvents, trailPoints, trailSources, trailTime, type HistoryRow } from "../trail.ts";
 import { limitEffects, weatherEntity, weatherState } from "../weather.ts";
-import { SHOW_ENERGY, SHOW_PRESENCE } from "../flags.ts";
+import { SHOW_PRESENCE } from "../flags.ts";
 import { hasFeature, manualUrl, shopUrl, type Feature } from "../features.ts";
 import { searchIndex, searchItems, type SearchItem } from "../search.ts";
 import { coverPositionable, lightAbilities } from "./quick-menu.ts";
@@ -80,6 +85,10 @@ export class Fp3dView3d extends LitElement {
     _stats: { state: true },
     _error: { state: true },
     _energy: { state: true },
+    _holo: { state: true },
+    _holoOpen: { state: true },
+    _wallboxW: { state: true },
+    _plants: { state: true },
     _flows: { state: true },
     _swipe: { state: true },
     _menu: { state: true },
@@ -149,6 +158,18 @@ export class Fp3dView3d extends LitElement {
   private declare _stats: ViewerStats | null;
   private declare _error: string | null;
   private declare _energy: EnergySummary | null;
+  /** Energie Pro: today's solar statistics for the hologram (kWh, peak and the day curve). */
+  private declare _holo: SolarDay | null;
+  private declare _holoOpen: boolean;
+  /** Power of the wallboxes in the plan (W), for the hologram. */
+  private declare _wallboxW: number | null;
+  /** The inverters with their own sensors (name and W), for the hologram when there are several plants. */
+  private declare _plants: { name: string; w: number }[];
+  private holoTimer: ReturnType<typeof setInterval> | undefined;
+  private holoEl: HTMLElement | null = null;
+  private holoIds = "";
+  /** The start view last handed to the viewer (JSON), to notice a new one. */
+  private shownStartView: string | undefined;
   /** A running swipe on a lamp or blind: the value shown next to the finger. */
   private declare _swipe: { entity: string; kind: "light" | "cover"; start: number; value: number; x: number; y: number } | null;
   /** Quick menu at a device (long press). */
@@ -251,6 +272,10 @@ export class Fp3dView3d extends LitElement {
     this._stats = null;
     this._error = null;
     this._energy = null;
+    this._holo = null;
+    this._holoOpen = true;
+    this._wallboxW = null;
+    this._plants = [];
     this._swipe = null;
     this._menu = null;
     this._through = null;
@@ -295,6 +320,8 @@ export class Fp3dView3d extends LitElement {
     this.cameraTimer = undefined;
     clearInterval(this.trailTimer);
     this.trailTimer = undefined;
+    clearInterval(this.holoTimer);
+    this.holoTimer = undefined;
     clearTimeout(this.flashTimer);
     this.flashTimer = undefined;
     this.viewer?.dispose();
@@ -352,13 +379,18 @@ export class Fp3dView3d extends LitElement {
       this.viewer.setFurnishMode(this.furnish);
       this.viewer.setSurfaceGrab(this.surfaceGrab ?? null);
       this.viewer.setFurnishTypes(this.furnishTypes ?? null);
+      this.viewer.setAnchorCallback((x, y, on, scale, facing) => this.placeHolo(x, y, on, scale, facing));
       this.viewer.setFloorStack(this.floorStack);
       this.viewer.setStats(this.showStats);
       this.viewer.setAutoOrbit(this.autoOrbit ? 0.06 : 0);
       this._low = this.viewer.low;
       this.viewer.setPacks([...getPacks()]);
       this.shownPacks = packsVersion();
-      if (this.building) this.viewer.setBuilding(this.building);
+      if (this.building) {
+        this.shownStartView = JSON.stringify(this.building.settings.start_view ?? null);
+        this.viewer.setStartView(this.building.settings.start_view ?? null);
+        this.viewer.setBuilding(this.building);
+      }
       this.scheduleThumbs();
       this.syncDevices(true);
       this.viewer.setFloor(this.floorId, false);
@@ -384,8 +416,18 @@ export class Fp3dView3d extends LitElement {
       v.setPacks([...getPacks()]);
       // vehicles in parking spots come from packs too: look them up again now that the packs are here
       if (this.hass && this.building) v.setParked(parkedVehicles(this.hass, this.building));
+      // a feature pack may have arrived with them (Energie Pro): the cables and modules follow
+      this.syncDevices(true);
     }
-    if (changed.has("building") && this.building) v.setBuilding(this.building);
+    if (changed.has("building") && this.building) {
+      // a new start view (just remembered in the editor) shows right away in the house view
+      const start = JSON.stringify(this.building.settings.start_view ?? null);
+      const startChanged = this.shownStartView !== undefined && this.shownStartView !== start;
+      this.shownStartView = start;
+      v.setStartView(this.building.settings.start_view ?? null);
+      v.setBuilding(this.building);
+      if (startChanged && this.floorId === null) v.resetView();
+    }
     if (changed.has("building") || changed.has("theme") || changed.has("floorThumbs") || changed.has("packs")) this.scheduleThumbs();
     const forced = ["building", "markerMode", "heatMode", "flows", "alerts", "dimmed"].some((k) => changed.has(k));
     if (forced || changed.has("hass")) this.syncDevices(forced);
@@ -440,6 +482,8 @@ export class Fp3dView3d extends LitElement {
       const furniture = [...this.furnitureLinks.values()].flatMap((l) => [l.entity, l.power]);
       const doors = b.floors.flatMap((f) => f.furniture.flatMap((m) => [m.door_left ?? null, m.door_right ?? null, m.soc ?? null, m.status ?? null]));
       const roofWindowIds = (b.settings.roof?.windows ?? []).flatMap((w) => [w.cover, w.contact, w.tilt]).filter((x): x is string => !!x && x !== "none");
+      // the solar fields' and strings' sensors feed the roof cables
+      const solarIds = [...(b.settings.roof?.solar ?? []).map((f) => f.entity), ...(b.settings.roof?.strings ?? []).map((s) => s.entity)].filter((x): x is string => !!x && x !== "none");
       const robotRooms = b.floors.flatMap((f) => f.furniture.filter((m) => m.type === "robot_vacuum").map((m) => robotRoomSensor(hass, this.furnitureLinks.get(m.id)?.entity ?? null, m.room_sensor)));
       const pictureRules = b.floors.flatMap((f) => f.furniture.flatMap((m) => (m.pictures ?? []).flatMap((r) => [r.entity, ...(r.image.startsWith("camera:") ? [r.image.slice(7)] : [])])));
       const heat =
@@ -451,7 +495,7 @@ export class Fp3dView3d extends LitElement {
       const parking = parkingEntities(b.floors);
       const motion = trailSources(hass, b).map((s) => s.entity);
       const weather = weatherEntity(hass, this.weatherEntityId ?? b.settings.weather_entity);
-      const all = [...placed, ...cameraSensors, ...links, ...power, ...furniture, ...doors, ...robotRooms, ...roofWindowIds, ...pictureRules, e.grid, e.solar, e.battery, e.battery_soc, e.tariff, ...presence, ...lights, ...heat, ...warn, ...parking, ...motion, weather, "sun.sun"];
+      const all = [...placed, ...cameraSensors, ...links, ...power, ...furniture, ...doors, ...robotRooms, ...roofWindowIds, ...solarIds, ...pictureRules, e.grid, e.solar, e.battery, e.battery_soc, e.consumption, e.tariff, ...presence, ...lights, ...heat, ...warn, ...parking, ...motion, weather, "sun.sun"];
       this.watched = [...new Set(all.filter((id): id is string => !!id))];
       force = true;
     }
@@ -463,11 +507,12 @@ export class Fp3dView3d extends LitElement {
     const deviceMarkers = buildMarkers(hass, b);
     const furniture = this.furnitureMarkers(hass, b, new Set(deviceMarkers.map((m) => m.id)), new Set(consumers.map((c) => c.powerEntity)));
     consumers.push(...furniture.consumers);
-    const summary = energySummary(hass, b, consumers);
+    const summary = energySummary(hass, b, consumers, deviceSensors(b, (f) => this.furnitureLinks?.get(f.id)?.power ?? null));
     // a placed power sensor shows its value as state text already, so only devices get a watt badge
     const byDevice = new Map(consumers.filter((c) => c.id !== c.powerEntity).map((c) => [c.id, c.power]));
     this.confirmSet = confirmEntities(hass, b.floors);
     const trail = this.trail ? this.trailNow(hass, b) : [];
+    const pro = hasFeature("energy_pro");
     v.setDevices([
       ...[...deviceMarkers, ...furniture.markers].map((m) => {
         // "without watts" drops the power badge (a plug shows only on / off)
@@ -476,6 +521,8 @@ export class Fp3dView3d extends LitElement {
         const marker = { ...m, power, powerText: power === null ? undefined : formatPower(hass, power), effect: this.dimmed ? false : m.effect };
         return { ...marker, pin: this.showPin(marker) };
       }),
+      // Energie Pro: the street end of the grid cable carries a pin with what comes in or goes out
+      ...(pro && (this.flows ?? this._flows) && !this.dimmed && summary.grid !== null ? [this.gridPin(hass, b, summary.grid)] : []).filter((m): m is NonNullable<typeof m> => !!m),
       // trail spots carry a pin with the time of the motion; the same sensor again stacks its pins
       ...trail.map((p, i) => ({
         id: `trail:${i}`,
@@ -518,11 +565,30 @@ export class Fp3dView3d extends LitElement {
       this.thumbSig = lampSig;
       if (!first) this.scheduleThumbs(1500);
     }
-    const batteryPlaced = b.energy.battery ? b.floors.flatMap((f) => f.placements.filter((p) => p.entity_id === b.energy.battery).map((p) => ({ floorId: f.id, x: p.x, z: p.z })))[0] : null;
+    // the battery cable ends at the home battery in the plan (older plans: at the placed battery sensor)
+    const batteryPlaced =
+      b.floors.flatMap((f) => f.furniture.filter((m) => m.type === "home_battery").map((m) => ({ floorId: f.id, x: m.x, z: m.z })))[0] ??
+      (b.energy.battery ? b.floors.flatMap((f) => f.placements.filter((p) => p.entity_id === b.energy.battery).map((p) => ({ floorId: f.id, x: p.x, z: p.z })))[0] : null);
+    const powers = pro ? fieldPowers(hass, b, summary.solar) : null;
+    // the hologram hangs over the middle of the chosen (else the biggest) solar field, moved as set up
+    const holo = b.settings.roof.hologram ?? DEFAULT_HOLOGRAM;
+    const fields = [...(b.settings.roof.solar ?? [])].sort((p, q) => q.rows * q.cols - p.rows * p.cols);
+    const first = pro && summary.solar !== null ? (fields.find((f) => f.id === holo.field) ?? fields[0]) : undefined;
+    const face = first ? fieldFace(b, first) : null;
+    if (first && face) {
+      const [fw, fd] = fieldSize(face, first);
+      const u = first.u + fw / 2 + holo.right;
+      const sv = first.v + fd / 2 + holo.up;
+      const c: [number, number, number] = [face.o[0] + face.eu[0] * u + face.es[0] * sv, face.o[1] + face.eu[1] * u + face.es[1] * sv, face.o[2] + face.eu[2] * u + face.es[2] * sv];
+      const floorId = face.wall?.floorId ?? (face.unbounded ? (b.floors.find((f) => f.elevation === Math.min(...b.floors.map((x) => x.elevation)))?.id ?? b.floors[0].id) : [...b.floors].sort((p, q) => q.elevation - p.elevation)[0].id);
+      v.setAnchor({ p: [c[0] + face.n[0] * 0.05, c[1] + face.n[1] * 0.05, c[2] + face.n[2] * 0.05], n: [face.n[0], face.n[1], face.n[2]], floorId, size: holo.size });
+    } else v.setAnchor(null);
+    // the modules live with their production (at night, and without Pro, they rest)
+    v.setSolarLevels(powers && !this.dimmed ? fieldLevels(b, powers) : new Map());
     v.setFlows(
-      !SHOW_ENERGY || !(this.flows ?? this._flows) || this.dimmed
+      !pro || !(this.flows ?? this._flows) || this.dimmed
         ? []
-        : flowSegments({ building: b, consumers, summary, battery: batteryPlaced ?? null }).map((f) => ({
+        : flowSegments({ building: b, consumers, summary, battery: batteryPlaced ?? null, fieldPower: powers, devicePower: this.devicePowers(hass, b) }).map((f) => ({
         floorId: f.floorId,
         a: f.a,
         b: f.b,
@@ -553,6 +619,171 @@ export class Fp3dView3d extends LitElement {
     const energy = hasEnergy ? summary : null;
     // a new object would make Lit render again; only changed values do
     if (JSON.stringify(energy) !== JSON.stringify(this._energy)) this._energy = energy;
+    const wallboxW = consumers.some((c) => c.wallbox) ? consumers.filter((c) => c.wallbox).reduce((s, c) => s + c.power, 0) : null;
+    // several plants (a big roof plant and a balcony plant): each inverter's own power
+    const plants = b.floors
+      .flatMap((f) => f.furniture.filter((m) => m.type === "inverter"))
+      .map((m) => {
+        const sensor = this.furnitureLinks?.get(m.id)?.power;
+        const w = sensor ? readPower(hass.states[sensor]) : null;
+        return w === null ? null : { name: m.name || furnitureName(hass, m.type), w: Math.max(0, w) };
+      })
+      .filter((p): p is { name: string; w: number } => !!p);
+    if (JSON.stringify(plants) !== JSON.stringify(this._plants)) this._plants = plants;
+    if (wallboxW !== this._wallboxW) this._wallboxW = wallboxW;
+    // the hologram's day curve: the solar sensors' statistics, fetched now and then while the sun is watched
+    const solarIds = pro && summary.solar !== null ? (b.energy.solar ? [b.energy.solar] : deviceSensors(b, (f) => this.furnitureLinks?.get(f.id)?.power ?? null).solar) : [];
+    this.watchSolarDay(solarIds);
+  }
+
+  /** The inverters' and batteries' own power (W, a battery positive = discharging) by furniture id. */
+  private devicePowers(hass: HomeAssistant, b: Building): Map<string, number> {
+    const out = new Map<string, number>();
+    for (const floor of b.floors) {
+      for (const f of floor.furniture) {
+        if (f.type !== "inverter" && f.type !== "home_battery") continue;
+        const sensor = this.furnitureLinks?.get(f.id)?.power;
+        const p = sensor ? readPower(hass.states[sensor], f.type === "home_battery" && b.energy.battery_invert) : null;
+        if (p !== null) out.set(f.id, p);
+      }
+    }
+    return out;
+  }
+
+  /** The pin at the street: grid import or export right now. */
+  private gridPin(hass: HomeAssistant, b: Building, grid: number) {
+    const g = gridPoint(b);
+    if (!g) return null;
+    const idle = Math.abs(grid) < 5;
+    return {
+      id: "grid",
+      floorId: g.floorId,
+      roomId: null,
+      x: g.end[0],
+      z: g.end[1],
+      y: 0.9,
+      icon: GRID_ICON,
+      name: translate(hass, "holo_grid"),
+      text: idle ? formatPower(hass, 0) : `${translate(hass, grid < 0 ? "energy_grid_export" : "energy_grid_import")} ${formatPower(hass, Math.abs(grid))}`,
+      active: !idle,
+      unavailable: false,
+      glow: null,
+      pin: true,
+    };
+  }
+
+  /** Fetch today's solar statistics every five minutes while there are sensors to watch (none: the curve goes). */
+  private watchSolarDay(ids: string[]): void {
+    const key = ids.join(",");
+    if (key === this.holoIds) return;
+    this.holoIds = key;
+    clearInterval(this.holoTimer);
+    this.holoTimer = undefined;
+    if (!ids.length) {
+      this._holo = null;
+      return;
+    }
+    const fetch = async () => {
+      if (!this.hass || document.hidden) return;
+      const day = await fetchSolarDay(this.hass, ids);
+      if (this.holoIds === key) this._holo = day;
+    };
+    void fetch();
+    this.holoTimer = setInterval(() => void fetch(), 300000);
+  }
+
+  /**
+   * Hangs the hologram on its anchor (called by the viewer after every frame): a thin line rises from the
+   * solar field to the card's lower left corner; the card keeps its size in the world and, seen from behind
+   * the field, shows its back (mirrored).
+   */
+  private placeHolo(x: number, y: number, on: boolean, scale: number, facing: boolean): void {
+    const el = (this.holoEl ??= this.renderRoot.querySelector<HTMLElement>(".nc3d-holo"));
+    const link = this.renderRoot.querySelector<SVGSVGElement>(".nc3d-holo-link");
+    if (!el) return;
+    const hidden = !on;
+    if (el.hidden !== hidden) el.hidden = hidden;
+    if (link && link.hasAttribute("hidden") !== hidden) link.toggleAttribute("hidden", hidden);
+    if (!on) return;
+    const s = scale * 0.8;
+    const dx = 34 * s;
+    const dy = 46 * s;
+    // the card's lower left corner (lower right when it is mirrored) sits up and to the side of the anchor
+    const cx = x + (facing ? dx : -dx);
+    const cy = y - dy;
+    el.style.transform = `translate(${cx.toFixed(1)}px, ${cy.toFixed(1)}px) scale(${(facing ? s : -s).toFixed(3)}, ${s.toFixed(3)}) translate(0, -100%)`;
+    if (link) {
+      const line = link.firstElementChild as SVGLineElement | null;
+      const dot = link.lastElementChild as SVGCircleElement | null;
+      line?.setAttribute("x1", x.toFixed(1));
+      line?.setAttribute("y1", y.toFixed(1));
+      line?.setAttribute("x2", cx.toFixed(1));
+      line?.setAttribute("y2", cy.toFixed(1));
+      dot?.setAttribute("cx", x.toFixed(1));
+      dot?.setAttribute("cy", y.toFixed(1));
+    }
+  }
+
+  /** Energie Pro: the glass hologram beside the house with the solar and energy balance of the moment. */
+  private renderHologram() {
+    const e = this._energy;
+    if (!hasFeature("energy_pro") || !e || e.solar === null || this.roomId || this.floorId !== null || !this.showEnergy) {
+      this.holoEl = null;
+      return nothing;
+    }
+    const hass = this.hass;
+    const t = (k: Parameters<typeof translate>[1]) => translate(hass, k);
+    const open = this._holoOpen;
+    const day = this._holo;
+    const autarky = e.consumption !== null && e.consumption > 0 ? Math.round(Math.min(100, Math.max(0, (1 - Math.max(0, e.grid ?? 0) / e.consumption) * 100))) : null;
+    const curve = day && day.curve.length > 1 ? solarCurvePath(day.curve, day.peak) : null;
+    const nowX = ((new Date().getHours() + new Date().getMinutes() / 60) / 24) * 220;
+    return html`<svg class="nc3d-holo-link" hidden aria-hidden="true"><line x1="0" y1="0" x2="0" y2="0" /><circle cx="0" cy="0" r="3" /></svg>
+      <div class="nc3d-holo ${open ? "" : "nc3d-holo-min"}" hidden role="button" tabindex="0" aria-label=${t("holo_title")} @click=${() => (this._holoOpen = !this._holoOpen)}>
+      <div class="nc3d-holo-sheen"></div>
+      <div class="nc3d-holo-scan"></div>
+      <div class="nc3d-holo-body">
+        <div class="nc3d-holo-head"><span>☀ ${t("holo_title")}</span><span class="nc3d-holo-live">● ${t("holo_live")}</span></div>
+        <div class="nc3d-holo-big"><b>${formatPower(hass, e.solar)}</b><span>${t("holo_pv_now")}</span></div>
+        ${open
+          ? html`${this._plants.length > 1
+                ? html`<div class="nc3d-holo-plants">${this._plants.map((p) => html`<span>${p.name}</span><b>${formatPower(hass, p.w)}</b>`)}</div>`
+                : nothing}
+              ${day
+                ? html`<div class="nc3d-holo-sub">${t("holo_today")} <b>${formatNumber(hass, day.kwh, 1)} kWh</b> · ${t("holo_peak")} <b>${formatPower(hass, day.peak)}</b></div>`
+                : nothing}
+              ${curve
+                ? svg`<svg class="nc3d-holo-curve" viewBox="0 0 220 44" width="208" height="38">
+                    <defs><linearGradient id="nc3dHoloG" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#ffd75a" stop-opacity=".5"/><stop offset="1" stop-color="#ffd75a" stop-opacity="0"/></linearGradient></defs>
+                    <path d="${curve.area}" fill="url(#nc3dHoloG)"/>
+                    <path d="${curve.line}" fill="none" stroke="#ffe27a" stroke-width="2"/>
+                    <circle cx="${curve.endX}" cy="${curve.endY}" r="3.5" fill="#fff" stroke="#ffd75a" stroke-width="2"/>
+                    <line x1="0" y1="43.5" x2="220" y2="43.5" stroke="rgba(160,240,255,.35)"/>
+                    <line x1="${nowX}" y1="2" x2="${nowX}" y2="43" stroke="rgba(160,240,255,.18)" stroke-dasharray="2 3"/>
+                  </svg>`
+                : nothing}
+              <div class="nc3d-holo-grid">
+                ${e.battery !== null || e.soc !== null
+                  ? html`<div class="nc3d-holo-cell nc3d-holo-bat">
+                      ${t("holo_battery")}<br /><b>${e.soc !== null ? `${Math.round(e.soc)} %` : formatPower(hass, Math.abs(e.battery ?? 0))}</b>
+                      ${e.battery !== null && Math.abs(e.battery) >= 5 ? html`<span>${e.battery < 0 ? "▲" : "▼"} ${formatPower(hass, Math.abs(e.battery))}</span>` : nothing}
+                    </div>`
+                  : nothing}
+                ${e.grid !== null
+                  ? html`<div class="nc3d-holo-cell ${e.grid < -5 ? "nc3d-holo-exp" : "nc3d-holo-imp"}">
+                      ${t("holo_grid")}<br /><b>${formatPower(hass, Math.abs(e.grid))}</b> <span>${Math.abs(e.grid) < 5 ? "" : t(e.grid < 0 ? "energy_grid_export" : "energy_grid_import")}</span>
+                    </div>`
+                  : nothing}
+                ${e.consumption !== null ? html`<div class="nc3d-holo-cell nc3d-holo-house">${t("holo_house")}<br /><b>${formatPower(hass, e.consumption)}</b></div>` : nothing}
+                ${this._wallboxW !== null ? html`<div class="nc3d-holo-cell nc3d-holo-wb">${t("holo_wallbox")}<br /><b>${formatPower(hass, this._wallboxW)}</b></div>` : nothing}
+              </div>
+              ${autarky !== null
+                ? html`<div class="nc3d-holo-bar"><div style="width:${autarky}%"></div></div>
+                    <div class="nc3d-holo-foot"><span>${t("holo_autarky")}</span><b>${autarky} %</b></div>`
+                : nothing}`
+          : nothing}
+      </div>
+    </div>`;
   }
 
   /** New warnings start the pulse (and a jump to the room when wanted); none stops it. */
@@ -677,10 +908,12 @@ export class Fp3dView3d extends LitElement {
         const id = (f.type === "home_battery" ? (extra ?? link.entity ?? link.power) : (link.entity ?? link.power ?? extra))!;
         targets.set(f.id, id);
         const st = link.entity ? hass.states[link.entity] : undefined;
-        const power = link.power ? readPower(hass.states[link.power]) : null;
+        // the meter's sensor is the grid (+ = import), the battery's can point the other way as well
+        const invert = f.type === "meter" ? b.energy.grid_invert : f.type === "home_battery" ? b.energy.battery_invert : false;
+        const power = link.power ? readPower(hass.states[link.power], invert) : null;
         if (link.power && power !== null && !consumerSensors.has(link.power)) {
           consumerSensors.add(link.power);
-          consumers.push({ id, powerEntity: link.power, floorId: floor.id, x: f.x, z: f.z, power: Math.max(0, power) });
+          consumers.push({ id, powerEntity: link.power, floorId: floor.id, x: f.x, z: f.z, power: Math.max(0, power), wallbox: f.type === "wallbox" || undefined });
         }
         const running = (power ?? 0) > 10 || st?.state === "on" || st?.state === "running" || (isStatusSensor(st) && isActive(st));
         if (f.type === "radiator" && st && kindOf(st.entity_id) === "climate") {
@@ -714,15 +947,26 @@ export class Fp3dView3d extends LitElement {
           z: f.z,
           y: markerHeight(f) + mountBase(floor, f),
           icon: iconSvg(kind ?? "switch"),
-          name: link.entity ? entityName(hass, link.entity) : furnitureName(hass, f.type),
-          text: f.type === "home_battery" ? this.batteryText(hass, extra, power) : f.type === "wallbox" ? this.wallboxText(hass, extra, power) : st ? stateText(hass, st) : power !== null ? formatPower(hass, Math.max(0, power)) : "",
+          name: f.name || (link.entity ? entityName(hass, link.entity) : furnitureName(hass, f.type)),
+          text:
+            f.type === "home_battery"
+              ? this.batteryText(hass, extra, power)
+              : f.type === "wallbox"
+                ? this.wallboxText(hass, extra, power)
+                : f.type === "meter"
+                  ? this.meterText(hass, power)
+                  : st
+                    ? stateText(hass, st)
+                    : power !== null
+                      ? formatPower(hass, Math.max(0, power))
+                      : "",
           active: st ? isActive(st) : (power ?? 0) > 5,
           unavailable: st ? isUnavailable(st) : false,
           glow: null,
           // its pin grabs the item when furnishing
           furnitureId: f.id,
           // inverter, battery, wallbox: their own text (watts, charge, status) is always worth a pin
-          energyDevice: f.type === "inverter" || f.type === "home_battery" || f.type === "wallbox",
+          energyDevice: f.type === "inverter" || f.type === "home_battery" || f.type === "wallbox" || f.type === "meter",
           show: f.marker ?? undefined,
           fromFurniture: true,
         });
@@ -884,6 +1128,13 @@ export class Fp3dView3d extends LitElement {
   }
 
   /** Wallbox: "lädt · 11 kW", "angesteckt" or its power, from a status sensor (on/off or a state such as charging). */
+  /** The meter: what the house draws from the grid, or feeds into it. */
+  private meterText(hass: HomeAssistant, power: number | null): string {
+    if (power === null) return "";
+    if (Math.abs(power) < 5) return formatPower(hass, 0);
+    return `${translate(hass, power < 0 ? "energy_grid_export" : "energy_grid_import")} ${formatPower(hass, Math.abs(power))}`;
+  }
+
   private wallboxText(hass: HomeAssistant, status: string | null, power: number | null): string {
     const st = status ? hass.states[status] : undefined;
     const raw = String(st?.state ?? "").toLowerCase();
@@ -939,7 +1190,7 @@ export class Fp3dView3d extends LitElement {
       z: f.z,
       y,
       icon: iconSvg("light"),
-      name: entity ? entityName(hass, entity) : furnitureName(hass, f.type),
+      name: f.name || (entity ? entityName(hass, entity) : furnitureName(hass, f.type)),
       text: st ? stateText(hass, st) : "",
       active: st ? isActive(st) : false,
       unavailable: st ? isUnavailable(st) : false,
@@ -1279,6 +1530,11 @@ export class Fp3dView3d extends LitElement {
     } else openMoreInfo(this, entityId);
   }
 
+  /** The camera as it stands (for "remember this view as the start"). */
+  currentView(): { theta: number; phi: number; radius: number } | null {
+    return this.viewer?.currentView() ?? null;
+  }
+
   resetView(): void {
     this._through = null;
     this.viewer?.resetView();
@@ -1300,7 +1556,7 @@ export class Fp3dView3d extends LitElement {
 
   private renderEnergy() {
     const e = this._energy;
-    if (!SHOW_ENERGY || !e || this.roomId || !this.showEnergy) return nothing;
+    if (!hasFeature("energy_pro") || !e || this.roomId || !this.showEnergy) return nothing;
     const t = (k: Parameters<typeof translate>[1]) => translate(this.hass, k);
     const items: { cls: string; label: string; value: string }[] = [];
     if (e.consumption !== null) items.push({ cls: "total", label: t("energy_consumption"), value: formatPower(this.hass, e.consumption) });
@@ -1377,7 +1633,7 @@ export class Fp3dView3d extends LitElement {
       class="nc3d-stage ${this.roomLabels ? "" : "nc3d-no-room-names"} ${this._low ? "nc3d-low" : ""} ${this.panelOpen ? "nc3d-panel-open" : ""} ${this._alerts.length ? "nc3d-has-alerts" : ""} ${this._through ? "nc3d-through-on" : ""} ${this._flash ? "nc3d-flash" : ""}"
       style=${style}
     >
-      ${this._error ? html`<p class="nc3d-error">${this._error}</p>` : nothing} ${this.renderEnergy()} ${this.renderLegend()}
+      ${this._error ? html`<p class="nc3d-error">${this._error}</p>` : nothing} ${this.renderEnergy()} ${this.renderHologram()} ${this.renderLegend()}
       ${this.renderAlerts()} ${this.renderThumbs()} ${this.renderScenes()} ${this.renderFind()} ${this.renderSwipe()} ${this.renderThrough()} ${this.renderProHint()} ${this.renderMenu()}
       ${this.showStats && this._stats
         ? html`<span class="nc3d-stats"
@@ -1960,6 +2216,187 @@ export class Fp3dView3d extends LitElement {
       }
       .nc3d-legend-none {
         color: var(--nc3d-warm);
+      }
+      /* Energie Pro: the glass hologram beside the house */
+      .nc3d-holo {
+        position: absolute;
+        left: 0;
+        top: 0;
+        z-index: 4;
+        width: 236px;
+        padding: 12px 14px 11px;
+        border-radius: 16px;
+        overflow: hidden;
+        cursor: pointer;
+        background: linear-gradient(140deg, rgba(150, 235, 255, 0.2) 0%, rgba(70, 140, 230, 0.08) 45%, rgba(20, 60, 140, 0.05) 100%);
+        backdrop-filter: blur(7px) saturate(150%);
+        -webkit-backdrop-filter: blur(7px) saturate(150%);
+        border: 1px solid rgba(160, 240, 255, 0.55);
+        box-shadow:
+          0 0 28px rgba(55, 224, 255, 0.35),
+          0 0 2px rgba(200, 250, 255, 0.9),
+          inset 0 1px 0 rgba(255, 255, 255, 0.45),
+          inset 0 0 36px rgba(55, 224, 255, 0.14);
+        color: #e6fbff;
+        font-size: 12px;
+        line-height: 1.35;
+        text-shadow: 0 0 6px rgba(80, 220, 255, 0.55);
+        will-change: transform;
+        transform-origin: 0 0;
+      }
+      .nc3d-holo[hidden],
+      .nc3d-holo-link[hidden] {
+        display: none;
+      }
+      /* the thin line from the solar field up to the card, with a dot on the field */
+      .nc3d-holo-link {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 3;
+        pointer-events: none;
+        overflow: visible;
+      }
+      .nc3d-holo-link line {
+        stroke: rgba(160, 240, 255, 0.75);
+        stroke-width: 1.2;
+        filter: drop-shadow(0 0 3px rgba(55, 224, 255, 0.8));
+      }
+      .nc3d-holo-link circle {
+        fill: #cffaff;
+        stroke: rgba(55, 224, 255, 0.8);
+        stroke-width: 2;
+        filter: drop-shadow(0 0 4px rgba(55, 224, 255, 0.9));
+      }
+      .nc3d-holo-min {
+        width: 150px;
+      }
+      .nc3d-holo-sheen {
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(115deg, rgba(255, 255, 255, 0.22) 0%, rgba(255, 255, 255, 0) 32%, rgba(255, 255, 255, 0) 68%, rgba(255, 255, 255, 0.07) 100%);
+        pointer-events: none;
+      }
+      .nc3d-holo-scan {
+        position: absolute;
+        inset: 0;
+        background: repeating-linear-gradient(0deg, rgba(160, 240, 255, 0.06) 0 1px, transparent 1px 4px);
+        pointer-events: none;
+      }
+      .nc3d-holo-body {
+        position: relative;
+      }
+      .nc3d-holo-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 10px;
+        letter-spacing: 0.14em;
+        color: #8ff0ff;
+        text-transform: uppercase;
+      }
+      .nc3d-holo-live {
+        color: #5dffb0;
+      }
+      .nc3d-holo-big {
+        display: flex;
+        align-items: baseline;
+        gap: 9px;
+        margin: 6px 0 1px;
+      }
+      .nc3d-holo-big b {
+        font-size: 26px;
+        color: #ffe27a;
+        text-shadow: 0 0 12px rgba(255, 210, 80, 0.85);
+        font-variant-numeric: tabular-nums;
+      }
+      .nc3d-holo-big span,
+      .nc3d-holo-sub {
+        color: #aee9ff;
+      }
+      .nc3d-holo-sub {
+        margin-bottom: 6px;
+      }
+      .nc3d-holo-plants {
+        display: grid;
+        grid-template-columns: auto auto;
+        justify-content: space-between;
+        column-gap: 10px;
+        margin: 0 0 5px;
+        font-size: 11px;
+        color: #aee9ff;
+      }
+      .nc3d-holo-plants b {
+        color: #ffe27a;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+      .nc3d-holo-sub b,
+      .nc3d-holo-cell b,
+      .nc3d-holo-foot b {
+        color: #fff;
+        font-variant-numeric: tabular-nums;
+      }
+      .nc3d-holo-curve {
+        display: block;
+        margin-bottom: 7px;
+        filter: drop-shadow(0 0 4px rgba(255, 215, 90, 0.7));
+      }
+      .nc3d-holo-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+      }
+      .nc3d-holo-cell {
+        border-left: 2px solid #aee9ff;
+        padding-left: 6px;
+      }
+      .nc3d-holo-cell span {
+        font-size: 11px;
+      }
+      .nc3d-holo-bat {
+        border-left-color: #5dffb0;
+      }
+      .nc3d-holo-bat span {
+        color: #5dffb0;
+      }
+      .nc3d-holo-exp {
+        border-left-color: #4ff6ff;
+      }
+      .nc3d-holo-exp span {
+        color: #4ff6ff;
+      }
+      .nc3d-holo-imp {
+        border-left-color: #ff6fb0;
+      }
+      .nc3d-holo-imp span {
+        color: #ff8fc4;
+      }
+      .nc3d-holo-house {
+        border-left-color: #a9c0ff;
+      }
+      .nc3d-holo-wb {
+        border-left-color: #63c9ff;
+      }
+      .nc3d-holo-bar {
+        margin-top: 8px;
+        height: 5px;
+        border-radius: 3px;
+        background: rgba(160, 240, 255, 0.16);
+        overflow: hidden;
+      }
+      .nc3d-holo-bar div {
+        height: 100%;
+        background: linear-gradient(90deg, #5dffb0, #4ff6ff);
+        box-shadow: 0 0 8px rgba(80, 240, 255, 0.8);
+      }
+      .nc3d-holo-foot {
+        display: flex;
+        justify-content: space-between;
+        margin-top: 3px;
+        font-size: 10px;
+        color: #aee9ff;
       }
       .nc3d-energy {
         position: absolute;
