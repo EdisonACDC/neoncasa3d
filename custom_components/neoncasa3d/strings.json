@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "NeonCasa 3D",
+        "description": "Disegna la tua casa e controllala in 3D. Dopo la configurazione apri NeonCasa 3D dal menu laterale e premi Disegna casa."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "NeonCasa 3D è già configurato."
+    }
+  }
+}

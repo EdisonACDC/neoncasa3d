@@ -1,0 +1,21 @@
+{
+  "domain": "neoncasa3d",
+  "name": "NeonCasa 3D",
+  "codeowners": [
+    "@EdisonACDC"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "frontend",
+    "http",
+    "panel_custom",
+    "websocket_api"
+  ],
+  "documentation": "https://github.com/EdisonACDC/neoncasa3d",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "1.0.0",
+  "issue_tracker": "https://github.com/EdisonACDC/neoncasa3d/issues"
+}

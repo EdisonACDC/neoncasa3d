@@ -1,0 +1,5 @@
+NeonCasa 3D 1.0.0 — edizione italiana indipendente.
+Derivato da NeonPlan 3D 1.8.1, Copyright (c) 2026 Mastershort, MIT.
+Originale: https://github.com/Mastershort/neonplan3d
+Traduzione italiana e separazione tecnica realizzate per Marius Grosu.
+I pacchetti commerciali restano soggetti alle licenze del loro autore.
