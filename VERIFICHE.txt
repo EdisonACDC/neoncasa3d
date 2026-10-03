@@ -1,0 +1,16 @@
+NeonCasa 3D 1.0.0
+
+Controlli completati:
+- 914 chiavi italiane: copertura completa e variabili segnaposto conservate.
+- TypeScript: compilazione dei tipi riuscita.
+- Bundle installabili: compilazione riuscita, tutti entro i limiti di dimensione originali.
+- Test frontend: 28 file di test superati, nessuno fallito. Le attese localizzate sono aggiornate alla lingua italiana.
+- Python: controllo sintattico riuscito.
+- Browser Chrome Headless: editor italiano aperto, piano e stanza creati, vista 3D renderizzata.
+- Componenti originali e NeonCasa registrati nello stesso browser senza errori.
+
+Limiti:
+- Test eseguiti in ambiente di sviluppo e demo, non su un Home Assistant reale.
+- La suite di integrazione Python che richiede Home Assistant non è stata eseguita.
+- Connessione al negozio e pacchetti commerciali non provati.
+- Nessuna installazione sul server dell’utente.
