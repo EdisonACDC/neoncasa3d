@@ -137,6 +137,20 @@ const shots = [
   { name: "editor-energy-devices", query: "", width: 1500, height: 1000, editor: true, editorScript: "e._tool = 'energy'; e._floorId = 'eg'; e._solarId = null; setTimeout(() => e.fit(), 300);", afterWait: 1500 },
   { name: "editor-energy-add", query: "", width: 1500, height: 1000, editor: true, editorScript: "e._tool = 'energy'; e._floorId = 'eg'; e._solarId = null; setTimeout(() => e.addEnergyDevice('wallbox'), 500);", afterWait: 1800 },
   { name: "editor-solar-list", query: "", width: 1280, height: 900, editor: true, editorScript: "e._tool = 'energy'; e._solarId = null; setTimeout(() => e.fit(), 300);" },
+  // Energie Pro: the cables from the roof to the inverter, battery, meter, wallbox and grid with their moving dots
+  { name: "view-flows", query: "?flows", width: 1280, height: 800, editor: true, editorScript: "e.fit();", then3d: "Alle Etagen", then3dAlso: ["Gestapelt"], camera: { theta: 0.6, phi: 1.15, radius: 22 } },
+  { name: "view-flows-garage", query: "?flows", width: 1280, height: 800, editor: true, editorScript: "e.fit();", then3d: "Alle Etagen", then3dAlso: ["Gestapelt"], camera: { theta: 3.6, phi: 1.2, radius: 16 } },
+  { name: "view-house-fr", query: "?lang=fr", width: 1280, height: 800, click: "Erdgeschoss" },
+  { name: "view-house-es", query: "?lang=es", width: 1280, height: 800, click: "Erdgeschoss" },
+  { name: "view-house-nl", query: "?lang=nl", width: 1280, height: 800, click: "Erdgeschoss" },
+  { name: "view-house-it", query: "?lang=it", width: 1280, height: 800, click: "Erdgeschoss" },
+  { name: "view-open-plan", query: "", width: 1280, height: 800, editor: true, editorScript: "const r = e._doc.floors[0].rooms.find((x) => x.id === 'kueche'); r.wall_heights = r.points.map(() => 0); e.setDoc(structuredClone(e._doc));", then3d: "Erdgeschoss" },
+  { name: "view-start-view", query: "", width: 1280, height: 800, editor: true, editorScript: "e.change((d) => (d.settings.start_view = { theta: 2.4, phi: 1.0, radius: 26 }));", then3d: "Alle Etagen" },
+  { name: "editor-cables", query: "?flows", width: 1500, height: 1000, editor: true, editorScript: "e._tool = 'energy'; e._floorId = 'eg'; e._solarId = null; setTimeout(() => { e.layCable('inv:' + e._doc.floors[0].furniture.find((m) => m.type === 'inverter').id); e.fit(); }, 400);", afterWait: 1800, scrollSide: true },
+  { name: "view-solar-live", query: "?flows&pv=5400", width: 1280, height: 800, editor: true, editorScript: "e.fit();", then3d: "Alle Etagen", then3dAlso: ["Gestapelt"], camera: { theta: 1.1, phi: 0.9, radius: 26 } },
+  { name: "view-flows-eg", query: "?flows", width: 1280, height: 800, editor: true, editorScript: "e.fit();", then3d: "Erdgeschoss", camera: { theta: 0.25, phi: 1.2, radius: 11 } },
+  { name: "view-flows-room", query: "?flows", width: 1280, height: 800, click: "Erdgeschoss", then: "Garage" },
+  { name: "view-flows-back", query: "?flows", width: 1280, height: 800, editor: true, editorScript: "e.fit();", then3d: "Alle Etagen", then3dAlso: ["Gestapelt"], camera: { theta: 2.6, phi: 1.1, radius: 18 } },
   { name: "editor-solar-flat", query: "", width: 1500, height: 900, editor: true, editorScript: "e.change((d) => { d.settings.roof.type = 'flat'; d.settings.roof.solar = []; }); setTimeout(() => { e._tool = 'energy'; e.addSolarField(); }, 500); setTimeout(() => e.fit(), 900);", afterWait: 2000 },
   { name: "editor-roof-overview", query: "", width: 1280, height: 900, editor: true, editorScript: FARM_SCRIPT + "e._floorId = e._doc.floors[0].id; e._tool = 'roof'; e._roofId = null; setTimeout(() => e.fit(), 300);" },
   { name: "view-roof-proposal", query: "", width: 1280, height: 800, editor: true, editorScript: FARM_SCRIPT + "setTimeout(() => { e._doc.settings.roof.sections = []; e.useRoofSections(); }, 300);", then3d: "Alle Etagen", then3dAlso: "Gestapelt", camera: { theta: 2.3, phi: 0.95, radius: 52 } },
@@ -309,6 +323,18 @@ for (const shot of shots.filter((s) => !only || only.includes(s.name))) {
       new Function("e", code)(e);
     }, shot.editorScript);
     await new Promise((r) => setTimeout(r, 1200 + (shot.afterWait ?? 0)));
+    // DEBUG_EVAL="<code using e>" prints what the editor says (for looking into a scene)
+    if (process.env.DEBUG_EVAL) {
+      const out = await page.evaluate((code) => {
+        const e = document.querySelector("neoncasa3d-panel").shadowRoot.querySelector("nc3d-editor");
+        try {
+          return String(new Function("e", "return " + code)(e));
+        } catch (err) {
+          return "ERROR " + err.message;
+        }
+      }, process.env.DEBUG_EVAL);
+      console.log("DEBUG", out);
+    }
     if (shot.then3d) {
       await clickText("3D");
       await clickText(shot.then3d);
@@ -322,6 +348,18 @@ for (const shot of shots.filter((s) => !only || only.includes(s.name))) {
           viewer.invalidate();
         }, shot.camera);
         await new Promise((r) => setTimeout(r, 1500));
+      }
+      // DEBUG_VIEW="<code using v>" prints what the panel's 3D view says after the switch
+      if (process.env.DEBUG_VIEW) {
+        const out = await page.evaluate((code) => {
+          const v = document.querySelector("neoncasa3d-panel").shadowRoot.querySelector("nc3d-view3d");
+          try {
+            return String(new Function("v", "return " + code)(v));
+          } catch (err) {
+            return "ERROR " + err.message;
+          }
+        }, process.env.DEBUG_VIEW);
+        console.log("DEBUG_VIEW", out);
       }
     }
   }
