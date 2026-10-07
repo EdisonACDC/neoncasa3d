@@ -2,6 +2,7 @@
 
 import { css, html, LitElement, nothing, svg, type PropertyValues, type TemplateResult } from "lit";
 import { fetchImage, listHistory, restoreSnapshot, storeImage, takeSnapshot, type Snapshot } from "../api.ts";
+import { parseScan, MAX_SCAN_BYTES } from "../lidar.ts";
 import { download, exportFile, parseExport } from "../transfer.ts";
 import { areaEntities, autoPlace, CLIMATE_CLASSES, defaultHeight, entityName, entityAreaId, furnitureEntities, groupByDevice, hasScreen, isMediaFurniture, isPlaceable, isRoomClimateSensor, kindOf, openingEntities, otherAreaEntities, pictureRuleMatches, roomClimateSensors, unassignedEntities, windowPosition, type ClimateKey } from "../devices.ts";
 import { furnitureSymbol } from "./furniture2d.ts";
@@ -3700,6 +3701,13 @@ export class Fp3dEditor extends LitElement {
               <button ?disabled=${!this._canUndo} @click=${() => this.undo()} title="Ctrl+Z">${this.t("undo")}</button>
               <button ?disabled=${!this._canRedo} @click=${() => this.redo()} title="Ctrl+Y">${this.t("redo")}</button>
               <button @click=${() => this.fit()}>${this.t("fit")}</button>
+              ${this.isAdmin ? html`<details class="nc3d-lidar"><summary>Scansione LiDAR</summary><div class="nc3d-lidar-help">
+                <b>Importa da NeonCasa Scanner</b>
+                <p>Scansiona le stanze con l’app iPhone, esporta il file JSON in File, poi selezionalo qui. Serve il formato NeonCasa Scanner; i file USDZ e quelli di altre app non sono ancora supportati.</p>
+                <p>Lo scanner iOS è un prototipo da compilare e firmare con Xcode: HACS non installa l’app sul telefono. La pagina web non può attivare il LiDAR.</p>
+                <p>Importa un piano alla volta. Stanze e mobili riconosciuti diventano modificabili; controlla le misure e associa le entità manualmente.</p>
+                <label class="nc3d-btn nc3d-upload">Importa scansione JSON<input aria-label="Importa scansione LiDAR" type="file" accept=".json,application/json" @change=${this.importLidar} /></label>
+              </div></details>` : nothing}
               <button aria-pressed=${this._split} title=${this.t("split_3d_hint")} @click=${() => this.toggleSplit()}>${this.t("split_3d")}</button>
               ${this.isAdmin ? html`<button aria-pressed=${!!this._doc.settings.lock_plan} title=${this.t("lock_plan_hint")} @click=${() => this.toggleLockPlan()}>${this.t("lock_plan")}</button>` : nothing}
             </div>
@@ -5769,6 +5777,32 @@ export class Fp3dEditor extends LitElement {
     }
   }
 
+  private async importLidar(e: Event): Promise<void> {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file || !this.hass?.user?.is_admin) return;
+    try {
+      if (file.size > MAX_SCAN_BYTES) throw new Error("File troppo grande: massimo 8 MB.");
+      const scan = parseScan(await file.text(), () => crypto.randomUUID());
+      if (this._doc.floors.length >= 20) throw new Error("Hai già raggiunto il limite di 20 piani.");
+      const f = scan.floor;
+      if (!confirm(`Importare «${f.name}» come NUOVO piano?\n${f.rooms.length} stanze, ${f.furniture.length} mobili, ${f.openings.length} porte/finestre/passaggi.\n\n${scan.warnings.join("\n")}\n\nI piani esistenti restano invariati. Puoi annullare l’importazione con Annulla.`)) return;
+      if (!this.hass?.user?.is_admin) return;
+      const next = structuredClone(this._doc);
+      f.elevation = floorElevation(next.floors, undefined);
+      next.floors.push(f);
+      this.setDoc(next);
+      this._floorId = f.id;
+      this._tool = "select";
+      this.selectItem("room", null);
+      this.fit();
+      this._notice = "Scansione importata. Controlla il piano, le misure e collega i dispositivi. Se è un piano separato, puoi modificarne la quota.";
+    } catch (err) {
+      alert(`Scansione non importata: ${(err as Error).message}`);
+    }
+  }
+
   private exportPlan(shareable: boolean): void {
     const day = new Date().toISOString().slice(0, 10);
     download(`neoncasa3d-${this.t(shareable ? "export_name_template" : "export_name_backup")}-${day}.json`, JSON.stringify(exportFile(this._doc, shareable), null, 2));
@@ -5913,6 +5947,11 @@ export class Fp3dEditor extends LitElement {
     tokens,
     controls,
     css`
+      .nc3d-lidar { position: relative; padding: 8px; }
+      .nc3d-lidar summary { cursor: pointer; }
+      .nc3d-lidar-help { position: absolute; top: 100%; left: 0; width: min(28rem, 80vw); max-height: 65vh; overflow: auto; padding: 16px; z-index: 30; background: #131e32; color: #edf3ff; border: 1px solid #34516e; border-radius: 12px; white-space: normal; }
+      .nc3d-lidar-help p { font-size: 13px; line-height: 1.5; }
+
       :host {
         display: block;
         height: 100%;
