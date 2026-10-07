@@ -1,6 +1,6 @@
 # NeonCasa 3D
 
-Versione italiana indipendente di **NeonPlan 3D**, progetto di **Mastershort**, distribuito con licenza MIT. NeonCasa 3D 1.1.0 deriva dalla versione 1.9.0; commit e provenienza sono in `UPSTREAM.json`. Non è una versione ufficiale dell'autore originale.
+Versione italiana indipendente di **NeonPlan 3D**, progetto di **Mastershort**, distribuito con licenza MIT. NeonCasa 3D 1.2.0 deriva dalla versione 1.9.0; commit e provenienza sono in `UPSTREAM.json`. Non è una versione ufficiale dell'autore originale.
 
 Disegna la casa in Home Assistant, arredala e controlla luci, tapparelle, termostati, sensori e dispositivi nella vista 3D. L'interfaccia include 963 testi italiani. Il pulsante **Disegna casa** apre l'editor. Geometria, grafica, funzioni e controlli restano quelli della versione di partenza.
 
@@ -61,3 +61,9 @@ I pacchetti opzionali e le funzioni Pro non sono resi gratuiti: verifiche delle 
 ## Sviluppo
 
 Dentro `frontend` esegui `npm ci`, `npm run typecheck`, `npm test` e `npm run build`. I bundle compilati sono già inclusi nell'integrazione. L'archivio contiene anche i sorgenti modificabili.
+
+## Scansioni LiDAR
+
+Nell’editor: Scansione LiDAR → Importa scansione JSON. Importa il formato NeonCasa Scanner come nuovo piano, con mobili semplificati e collegamenti Home Assistant da assegnare manualmente. Non importa USDZ o JSON generici.
+
+Lo scanner iPhone in ios/ è un prototipo sorgente: richiede compilazione e firma con Xcode su Mac e prova su iPhone LiDAR. Non è un’app già installabile e HACS non la installa. Vedi ios/README.md.

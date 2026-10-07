@@ -1,6 +1,6 @@
 # NeonCasa 3D
 
-Versione italiana indipendente di **NeonPlan 3D**, progetto di **Mastershort**, distribuito con licenza MIT. NeonCasa 3D 1.1.0 deriva dalla versione 1.9.0; commit e provenienza sono in `UPSTREAM.json`. Non è una versione ufficiale dell'autore originale.
+Versione italiana indipendente di **NeonPlan 3D**, progetto di **Mastershort**, distribuito con licenza MIT. NeonCasa 3D 1.2.0 deriva dalla versione 1.9.0; commit e provenienza sono in `UPSTREAM.json`. Non è una versione ufficiale dell'autore originale.
 
 Disegna la casa in Home Assistant, arredala e controlla luci, tapparelle, termostati, sensori e dispositivi nella vista 3D. L'interfaccia include 963 testi italiani. Il pulsante **Disegna casa** apre l'editor. Geometria, grafica, funzioni e controlli restano quelli della versione di partenza.
 
@@ -72,3 +72,9 @@ Dentro `frontend` esegui `npm ci`, `npm run typecheck`, `npm test` e `npm run bu
 - Predisposizione originale **Energia Pro**, soggetta a disponibilità e licenza: nessuno sblocco incluso.
 
 Aggiorna da HACS, riavvia Home Assistant e ricarica la pagina. I disegni NeonCasa esistenti restano negli stessi archivi. Prima di aggiornare puoi esportare una copia completa dall'editor. L'interfaccia rimane italiana anche se l'account Home Assistant usa un'altra lingua.
+
+## Scansioni LiDAR — 1.2.0
+
+Nell'editor apri **Scansione LiDAR → Importa scansione JSON**. Il file compatibile viene aggiunto come **nuovo piano**, senza sostituire quelli presenti, dopo un riepilogo di stanze, mobili, aperture e avvisi. **Annulla** ripristina lo stato precedente. Le entità Home Assistant non vengono associate automaticamente.
+
+L'importatore è verificato con dati sintetici. Per acquisire le scansioni serve un'app nativa iOS: il browser e l'aggiornamento HACS non attivano il LiDAR. I sorgenti del prototipo **NeonCasa Scanner** e le istruzioni di compilazione/firma sono in [ios/README.md](ios/README.md). **Non è ancora incluso uno scanner firmato e provato su iPhone.** Non sono supportati USDZ o JSON arbitrari di altre app.

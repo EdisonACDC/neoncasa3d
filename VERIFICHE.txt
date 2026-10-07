@@ -1,18 +1,21 @@
-NeonCasa 3D 1.1.0 — base NeonPlan 3D 1.9.0
+NeonCasa 3D 1.2.0 — importazione LiDAR e prototipo iOS
 
-Verifiche completate:
-- 963 chiavi italiane complete, segnaposto coerenti con la base 1.9.0.
-- TypeScript: controllo dei tipi riuscito.
-- Compilazione dei quattro bundle riuscita, entro i limiti previsti dalla 1.9.0.
-- Suite frontend: 28 file di test superati (inclusi i nuovi controlli energia e pareti).
-- Python: controllo sintattico riuscito.
-- Schema backend: accetta dati della versione precedente e conserva nuovi nomi, pareti con altezza zero e vista iniziale.
-- Chrome locale: apertura editor italiano, creazione piano e stanza, rimozione parete, pannello Bilancio energetico, aggiunta contatore, nome personalizzato e memorizzazione vista iniziale.
-- Vista 3D renderizzata senza errori JavaScript.
-- Componenti originali e NeonCasa registrati insieme senza conflitti.
+Verifiche di questa versione:
+- TypeScript: controllo tipi riuscito.
+- Frontend: 163 test superati, zero errori.
+- Otto test specifici per importazione, coordinate condivise, mobili, aperture,
+  deduplicazione, limiti, input malformato e assenza di modifiche al file sorgente.
+- Compilazione bundle riuscita entro i limiti previsti.
 
 Limiti:
-- Non eseguito sul server Home Assistant dell'utente.
+- Dati di scansione sintetici; nessuna scansione fisica iPhone verificata.
+- Sorgenti iOS NON compilati con Xcode e NON provati su dispositivo.
+- App iPhone da compilare, firmare e installare separatamente; HACS non la installa.
+- Importazione limitata al formato NeonCasa Scanner documentato in ios/README.md.
+- Interfaccia nuova non verificata in browser: download Chrome di test non disponibile.
+- Non eseguito sul server Home Assistant dell’utente.
 - Suite di integrazione Python con Home Assistant non eseguita.
-- Acquisto/attivazione commerciale dei pacchetti Pro non verificati; licenze e firme conservate.
-- Energia Pro include la predisposizione della 1.9.0, senza sblocco.
+- Licenze e firme dei pacchetti Pro conservate, attivazione commerciale non verificata.
+
+Le verifiche browser e schema della 1.1.0 restano verifiche della versione precedente,
+non sono presentate come prove della nuova funzione LiDAR.
